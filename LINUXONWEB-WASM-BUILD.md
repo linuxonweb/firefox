@@ -67,8 +67,9 @@ checked in.
    argument list (no debug info), and `firefox-objects.list` names its
    inputs. `build-firefox-release.sh` also compiles the guest `glremote.o`
    GL bridge and links the result as `firefox.preoptimizer.wasm`. The
-   `glremote` source is in the linuxonweb project
-   (`web/linux/tests/guest-glremote/`), not in this repository.
+   `glremote` source is in the `linuxonweb/guest-glremote` repo. The release
+   script expects it at `web/linux/tests/guest-glremote/` of the project
+   layout, so put that repo there or edit the path before building.
 7. **Optimize.** `wasm-opt -O2` produces `firefox.optimized.wasm`, and then
    `--fpcast-emu` (a function-pointer ABI pass, `max-func-params@23`)
    produces `firefox.fpcast.wasm`. Test relinks set `FAST_SKIP_O2=1` to skip
