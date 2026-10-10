@@ -43,6 +43,7 @@
 #include "util/Unicode.h"
 #include "vm/AsyncFunction.h"
 #include "vm/AsyncIteration.h"
+#include "vm/BytecodeUtil.h"
 #include "vm/DateObject.h"
 #include "vm/EnvironmentObject.h"
 #include "vm/EqualityOperations.h"
@@ -67,6 +68,17 @@
 #include "vm/JSScript-inl.h"
 #include "vm/PlainObject-inl.h"
 #include "vm/Realm-inl.h"
+
+namespace js {
+namespace pbljit {
+struct Exit { uint64_t* sp; int32_t pcDelta; uint32_t icIndex; };
+void ObserveSkip(JSScript* script, jsbytecode* pc, JSContext* cx,
+                 const char* reason);
+void ObservePolicy(JSScript* script, JSContext* cx);
+bool OnLoopHead(JSScript* script, jit::BaselineFrame* frame, uint64_t* sp,
+                jsbytecode* pc, JSContext* cx, Exit* exit);
+}  // namespace pbljit
+}  // namespace js
 
 namespace js {
 namespace pbl {
@@ -8231,12 +8243,37 @@ PBIResult PortableBaselineInterpret(
 #ifdef ENABLE_INTERRUPT_CHECKS
         if (ctx.frameMgr.cxForLocalUseOnly()->hasAnyPendingInterrupt()) {
           PUSH_EXIT_FRAME();
-          if (!InterruptCheck(cx)) {
+          bool interruptAllowed = InterruptCheck(cx);
+          js::pbljit::ObserveSkip(frame->script(), pc, cx,
+              interruptAllowed ? "interrupt-callback-continue" : "interrupt-callback-abort");
+          if (!interruptAllowed) {
             GOTO_ERROR();
           }
         }
 #endif
         COUNT_COVERAGE_PC(pc);
+        // This adapter may not GC, walk the stack, or invoke JS/runtime calls.
+        if (!frame->isDebuggee() && !frame->script()->hasScriptCounts()) {
+          static_assert(sizeof(StackVal) == sizeof(uint64_t));
+          js::pbljit::Exit jx;
+          if (MOZ_UNLIKELY(js::pbljit::OnLoopHead(
+                  frame->script(), frame, reinterpret_cast<uint64_t*>(sp), pc,
+                  ctx.frameMgr.cxForLocalUseOnly(), &jx))) {
+            sp = reinterpret_cast<StackVal*>(jx.sp);
+            pc += jx.pcDelta;
+            // Nightly consumes the local cursor; keep the saved cursor coherent.
+            icEntry = icEntries + jx.icIndex;
+            frame->interpreterICEntry() = icEntry;
+            DISPATCH();
+          }
+        } else {
+          if (frame->isDebuggee())
+            js::pbljit::ObserveSkip(frame->script(), pc,
+                ctx.frameMgr.cxForLocalUseOnly(), "skip-debuggee");
+          if (frame->script()->hasScriptCounts())
+            js::pbljit::ObserveSkip(frame->script(), pc,
+                ctx.frameMgr.cxForLocalUseOnly(), "skip-coverage");
+        }
         END_OP(LoopHead);
       }
       CASE(AfterYield) {
@@ -9302,6 +9339,12 @@ MethodStatus CanEnterPortableBaselineInterpreter(JSContext* cx,
   // Resuming a suspended generator or async function/module is not supported.
   MOZ_ASSERT(!state.isGeneratorResume());
 
+#if !defined(__wasm__) || defined(__wasi__) || !defined(JS_CODEGEN_NONE) || !defined(ENABLE_PORTABLE_BASELINE_INTERP) || !defined(ENABLE_INTERRUPT_CHECKS)
+#  error "Guest specializer requires real threaded Linux/wasm PBL and interrupts"
+#endif
+  if (state.script()->baselineDisabled()) {
+    return MethodStatus::Method_CantCompile;
+  }
   if (!JitOptions.portableBaselineInterpreter) {
     return MethodStatus::Method_CantCompile;
   }
@@ -9328,6 +9371,23 @@ MethodStatus CanEnterPortableBaselineInterpreter(JSContext* cx,
   if (state.script()->getWarmUpCount() <=
       JitOptions.portableBaselineInterpreterWarmUpThreshold) {
     return MethodStatus::Method_Skipped;
+  }
+  // After warmup and before first JitScript allocation: retain C++ exception policy.
+  bool reject = false;
+  for (const auto& note : state.script()->trynotes()) {
+    reject |= note.kind() == TryNoteKind::Catch ||
+              note.kind() == TryNoteKind::Finally;
+  }
+  for (jsbytecode* pc = state.script()->code();
+       !reject && pc < state.script()->codeEnd(); pc += GetBytecodeLength(pc)) {
+    JSOp op = JSOp(*pc);
+    reject = op == JSOp::Throw || op == JSOp::ThrowWithStack;
+  }
+  if (reject) {
+    MOZ_RELEASE_ASSERT(!state.script()->hasJitScript());
+    js::pbljit::ObservePolicy(state.script(), cx);
+    state.script()->disableBaselineCompile();
+    return MethodStatus::Method_CantCompile;
   }
   if (!cx->zone()->ensureJitZoneExists(cx)) {
     return MethodStatus::Method_Error;

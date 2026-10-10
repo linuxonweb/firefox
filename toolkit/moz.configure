@@ -196,7 +196,7 @@ set_config("MOZ_CONFIGURE_OPTIONS", all_configure_options)
 
 @depends(target)
 def fold_libs(target):
-    return target.os in ("WINNT", "OSX", "iOS", "Android")
+    return target.os in ("WINNT", "OSX", "iOS", "Android") or target.cpu == "wasm32"
 
 
 set_config("MOZ_FOLD_LIBS", fold_libs)
@@ -275,8 +275,12 @@ imply_option("--enable-replace-malloc", dmd, when=compile_environment)
 # ==============================================================
 @depends(target)
 def midir_linux_support(target):
+    # wasm32-linux (tombl) has no ALSA; exclude like riscv64.
     return (
-        target.kernel == "Linux" and target.os != "Android" and target.cpu != "riscv64"
+        target.kernel == "Linux"
+        and target.os != "Android"
+        and target.cpu != "riscv64"
+        and target.cpu != "wasm32"
     )
 
 

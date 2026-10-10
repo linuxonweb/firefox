@@ -11,17 +11,16 @@
         {
           'target_name': 'nss_libs',
           'type': 'none',
-          'dependencies': [
-            'lib/softoken/softoken.gyp:softokn3',
-          ],
+          'dependencies': [],
           'conditions': [
-            [ 'OS=="solaris" and target_arch=="sparc64"', {
+            [ 'wasm_static==0 and OS=="solaris" and target_arch=="sparc64"', {
               'dependencies': [
                 'lib/freebl/freebl.gyp:freebl_64int_3',
                 'lib/freebl/freebl.gyp:freebl_64fpu_3',
               ],
-            }, {
+            }, 'wasm_static==0', {
               'dependencies': [
+                'lib/softoken/softoken.gyp:softokn3',
                 'lib/freebl/freebl.gyp:freebl3',
               ],
             }],
@@ -34,7 +33,7 @@
                 'lib/util/util.gyp:nssutil3',
               ],
             }],
-            [ 'OS=="linux"', {
+            [ 'wasm_static==0 and OS=="linux"', {
               'dependencies': [
                 'lib/freebl/freebl.gyp:freeblpriv3',
               ],

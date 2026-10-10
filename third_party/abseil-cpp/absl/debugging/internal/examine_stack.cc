@@ -156,7 +156,7 @@ SymbolizeUrlEmitter GetDebugStackTraceHook() { return debug_stack_trace_hook; }
 // unknown. vuc is a ucontext_t*. We use void* to avoid the use of
 // ucontext_t on non-POSIX systems.
 void* GetProgramCounter(void* const vuc) {
-#ifdef __linux__
+#if defined(__linux__) && !(defined(__wasm__) && !defined(__wasi__))
   if (vuc != nullptr) {
     ucontext_t* context = reinterpret_cast<ucontext_t*>(vuc);
 #if defined(__aarch64__)

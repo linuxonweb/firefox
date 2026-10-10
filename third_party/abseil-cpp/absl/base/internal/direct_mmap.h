@@ -24,7 +24,7 @@
 
 #include <sys/mman.h>
 
-#ifdef __linux__
+#if defined(__linux__) && !(defined(__wasm__) && !defined(__wasi__))
 
 #include <sys/types.h>
 #ifdef __BIONIC__

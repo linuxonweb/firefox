@@ -454,7 +454,9 @@ struct llama_mmap::impl {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
+#ifdef MAP_POPULATE
         if (prefetch) { flags |= MAP_POPULATE; }
+#endif
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
@@ -636,7 +638,7 @@ const bool llama_mmap::SUPPORTED  = false;
 // llama_mlock
 
 struct llama_mlock::impl {
-#ifdef _POSIX_MEMLOCK_RANGE
+#if defined(_POSIX_MEMLOCK_RANGE) && !(defined(__linux__) && defined(__wasm__) && !defined(__wasi__))
     static size_t lock_granularity() {
         return (size_t) sysconf(_SC_PAGESIZE);
     }
@@ -770,7 +772,7 @@ llama_mlock::~llama_mlock() = default;
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
 
-#if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
+#if (defined(_POSIX_MEMLOCK_RANGE) && !(defined(__linux__) && defined(__wasm__) && !defined(__wasi__))) || defined(_WIN32)
 const bool llama_mlock::SUPPORTED = true;
 #else
 const bool llama_mlock::SUPPORTED = false;

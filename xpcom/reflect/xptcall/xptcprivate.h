@@ -51,11 +51,20 @@ class nsXPTCStubBase final : public nsIXPTCStubBase {
   nsIXPTCProxy* mOuter;
   const nsXPTInterfaceInfo* mEntry;
 
+#if defined(__wasm__) && defined(__linux__) && !defined(__wasi__)
+  uintptr_t* mWasmVTable = nullptr;
+  ~nsXPTCStubBase() { delete[] mWasmVTable; }
+#else
   ~nsXPTCStubBase() = default;
+#endif
 };
 
 #undef STUB_ENTRY
 #undef SENTINEL_ENTRY
+
+#if defined(__wasm__) && defined(__linux__) && !defined(__wasi__)
+nsresult WasmInitXPTCStub(nsXPTCStubBase* aStub);
+#endif
 
 #if defined(__clang__) || defined(__GNUC__)
 #  define ATTRIBUTE_USED __attribute__((__used__))

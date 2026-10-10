@@ -8,6 +8,9 @@
 #include <glib.h>
 #include <gtk/gtk.h>
 #include <inttypes.h>
+#if defined(__linux__) && defined(__wasm__) && !defined(__wasi__) && defined(MOZ_X11)
+#  include <gdk/gdkx.h>
+#endif
 #ifdef MOZ_X11
 #  include <X11/Xatom.h>
 #  include <X11/Xlib.h>
@@ -108,8 +111,14 @@ bool GdkIsWaylandDisplay(GdkDisplay* display) {
 }
 
 bool GdkIsX11Display(GdkDisplay* display) {
+#if defined(__linux__) && defined(__wasm__) && !defined(__wasi__) && defined(MOZ_X11)
+  // The native static link has no dynamic symbol lookup. Use the linked
+  // GTK backend entry point and retain the normal GType instance check.
+  static auto sGdkX11DisplayGetType = gdk_x11_display_get_type;
+#else
   static auto sGdkX11DisplayGetType =
       (GType (*)())dlsym(RTLD_DEFAULT, "gdk_x11_display_get_type");
+#endif
   return sGdkX11DisplayGetType &&
          G_TYPE_CHECK_INSTANCE_TYPE(display, sGdkX11DisplayGetType());
 }

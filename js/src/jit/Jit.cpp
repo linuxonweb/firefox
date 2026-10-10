@@ -238,6 +238,11 @@ EnterJitStatus js::jit::MaybeEnterJit(JSContext* cx, RunState& state) {
 
   JSScript* script = state.script();
 
+#if defined(__wasm__) && defined(JS_CODEGEN_NONE) && defined(ENABLE_PORTABLE_BASELINE_INTERP)
+  if (script->baselineDisabled()) {
+    return EnterJitStatus::NotEntered;
+  }
+#endif
   uint8_t* code = script->jitCodeRaw();
 
 #ifdef JS_CACHEIR_SPEW

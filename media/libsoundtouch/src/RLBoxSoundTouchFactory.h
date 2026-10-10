@@ -5,6 +5,11 @@
 #include "SoundTouch.h"
 
 // Exposed C API that is used by RLBox
+#if defined(__wasm__) && defined(__linux__) && !defined(__wasi__)
+#  define MOZ_SOUNDTOUCH_CLEAR NightlySoundTouchClear
+#else
+#  define MOZ_SOUNDTOUCH_CLEAR Clear
+#endif
 
 extern "C" {
 
@@ -22,6 +27,6 @@ void PutSamples(soundtouch::SoundTouch* mTimeStretcher,
                 const soundtouch::SAMPLETYPE* samples, uint numSamples);
 uint ReceiveSamples(soundtouch::SoundTouch* mTimeStretcher,
                     soundtouch::SAMPLETYPE* output, uint maxSamples);
-void Clear(soundtouch::SoundTouch* mTimeStretcher);
+void MOZ_SOUNDTOUCH_CLEAR(soundtouch::SoundTouch* mTimeStretcher);
 void Flush(soundtouch::SoundTouch* mTimeStretcher);
 }

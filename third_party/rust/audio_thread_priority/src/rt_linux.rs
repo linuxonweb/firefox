@@ -62,6 +62,10 @@ impl RtPriorityThreadInfoInternal {
     /// struct, so no uninitialized padding bytes are ever read. Any trailing padding stays zero.
     pub fn serialize(&self) -> [u8; std::mem::size_of::<Self>()] {
         let thread_id = self.thread_id.to_ne_bytes();
+        // Native wasm32 musl pthread_t is an opaque pointer of usize width.
+        #[cfg(all(target_arch = "wasm32", target_env = "musl"))]
+        let pthread_id = (self.pthread_id as usize).to_ne_bytes();
+        #[cfg(not(all(target_arch = "wasm32", target_env = "musl")))]
         let pthread_id = self.pthread_id.to_ne_bytes();
         let pid = self.pid.to_ne_bytes();
         let policy = self.policy.to_ne_bytes();
@@ -91,7 +95,12 @@ impl RtPriorityThreadInfoInternal {
         let mut src = bytes.iter().copied();
         RtPriorityThreadInfoInternal {
             thread_id: kernel_pid_t::from_ne_bytes(take(&mut src)),
-            pthread_id: libc::pthread_t::from_ne_bytes(take(&mut src)),
+            pthread_id: {
+                #[cfg(all(target_arch = "wasm32", target_env = "musl"))]
+                { usize::from_ne_bytes(take(&mut src)) as libc::pthread_t }
+                #[cfg(not(all(target_arch = "wasm32", target_env = "musl")))]
+                { libc::pthread_t::from_ne_bytes(take(&mut src)) }
+            },
             pid: libc::pid_t::from_ne_bytes(take(&mut src)),
             policy: libc::c_int::from_ne_bytes(take(&mut src)),
             priority: libc::c_int::from_ne_bytes(take(&mut src)),

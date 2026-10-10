@@ -1775,10 +1775,16 @@ impl Build {
                         ));
                     }
                 } else if target.os == "linux" {
-                    let musl_sysroot = self.wasm_musl_sysroot().unwrap();
+                    // Native Linux C++ ABI archives may differ from the header/libc sysroot.
+                    let runtime_libdir = self
+                        .get_env("WASM_MUSL_CXX_RUNTIME_LIBDIR")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            Path::new(&self.wasm_musl_sysroot().unwrap()).join("lib")
+                        });
                     self.cargo_output.print_metadata(&format_args!(
-                        "cargo:rustc-flags=-L {}/lib -lstatic=c++ -lstatic=c++abi",
-                        Path::new(&musl_sysroot).display(),
+                        "cargo:rustc-flags=-L {} -lstatic=c++ -lstatic=c++abi",
+                        runtime_libdir.display(),
                     ));
                 }
             }

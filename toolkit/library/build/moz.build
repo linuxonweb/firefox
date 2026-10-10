@@ -12,7 +12,7 @@ USE_LIBS += ["gkrust"]
 
 Libxul("xul-real")
 
-if CONFIG["COMPILE_ENVIRONMENT"]:
+if CONFIG["COMPILE_ENVIRONMENT"] and CONFIG["TARGET_CPU"] != "wasm32":
     if CONFIG["MOZ_WIDGET_TOOLKIT"] in ("cocoa", "uikit"):
         full_libname = SHARED_LIBRARY_NAME
     else:

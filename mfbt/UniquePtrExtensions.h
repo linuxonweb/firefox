@@ -227,14 +227,14 @@ using UniqueFreePtr = UniquePtr<T, detail::FreePolicy<T>>;
 using UniqueFileHandle =
     UniquePtr<detail::FileHandleType, detail::FileHandleDeleter>;
 
-#ifndef __wasm__
-// WASI does not have `dup`
+#if !defined(__wasm__) || (defined(XP_LINUX) && !defined(__wasi__))
+// WASI does not have `dup`; native Linux/Wasm has POSIX descriptors.
 // On Unix, these set the close-on-exec flag for the new fd.
 MFBT_API UniqueFileHandle DuplicateFileHandle(detail::FileHandleType aFile);
 inline UniqueFileHandle DuplicateFileHandle(const UniqueFileHandle& aFile) {
   return DuplicateFileHandle(aFile.get());
 }
-#endif  // not wasm
+#endif  // non-Wasm or native Linux/Wasm
 
 #ifdef XP_UNIX
 // For systems that don't have the full set of POSIX atomic cloexec APIs.

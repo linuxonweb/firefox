@@ -73,6 +73,10 @@ SOFTWARE.
 #include "cairo/pixman-rename.h"
 #endif
 
+#if defined(__wasm__) && defined(__linux__) && !defined(__wasi__)
+#include "NightlyPixmanStaticNames.h"
+#endif
+
 #include <pixman-version.h>
 
 #ifdef  __cplusplus

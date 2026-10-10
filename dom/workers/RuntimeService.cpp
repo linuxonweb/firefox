@@ -3,6 +3,19 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "RuntimeService.h"
+#if defined(__wasm__) && !defined(__wasi__) && defined(ENABLE_PORTABLE_BASELINE_INTERP)
+#  include "jsapi.h"
+#  include <atomic>
+#  include <stdio.h>
+#  include <stdlib.h>
+#  include <pthread.h>
+#  include <sys/syscall.h>
+#  include <unistd.h>
+namespace js { namespace pbljit {
+void PrintObservation(const char* failure, const char* format, ...)
+    __attribute__((format(printf, 2, 3)));
+} }
+#endif
 
 #include <algorithm>
 
@@ -795,6 +808,28 @@ bool InitJSContextForWorker(WorkerPrivate* aWorkerPrivate,
   aWorkerPrivate->CopyJSSettings(settings);
 
   JS::ContextOptionsRef(aWorkerCx) = settings.contextOptions;
+
+#if defined(__wasm__) && !defined(__wasi__) && defined(ENABLE_PORTABLE_BASELINE_INTERP)
+  // Opt-in initialization diagnostic, outside any generated-module hot hook.
+  static std::atomic<unsigned> optionObservationCount{0};
+  const char* observePortable = getenv("PBLJIT_OBSERVE");
+  if (observePortable && observePortable[0] == '1' && observePortable[1] == '\0') {
+    unsigned optionObservationIndex = optionObservationCount.fetch_add(1, std::memory_order_relaxed);
+    if (optionObservationIndex == 64)
+      js::pbljit::PrintObservation("PBLJIT_OPTION_EXHAUSTED reason=emission-failed\n", "PBLJIT_OPTION_EXHAUSTED event=worker-context budget=64 pid=%ld\n", static_cast<long>(getpid()));
+    if (optionObservationIndex < 64) {
+    uint32_t actualPortable = 0, actualWarmup = 0;
+    bool gotPortable = JS_GetGlobalJitCompilerOption(aWorkerCx,
+        JSJITCOMPILER_PORTABLE_BASELINE_ENABLE, &actualPortable);
+    bool gotWarmup = JS_GetGlobalJitCompilerOption(aWorkerCx,
+        JSJITCOMPILER_PORTABLE_BASELINE_WARMUP_THRESHOLD, &actualWarmup);
+    js::pbljit::PrintObservation("PBLJIT_OPTION_EXHAUSTED reason=emission-failed\n", "PBLJIT_OPTION event=worker-context pid=%ld tid=%ld pthread=%lu option=%u threshold=%u available=%u worker=%p\n",
+        static_cast<long>(getpid()), syscall(SYS_gettid),
+        static_cast<unsigned long>((uintptr_t)pthread_self()),
+        actualPortable, actualWarmup, unsigned(gotPortable && gotWarmup), static_cast<void*>(aWorkerPrivate));
+    }
+  }
+#endif
 
   // This is the real place where we set the max memory for the runtime.
   for (const auto& setting : settings.gcSettings) {

@@ -5,7 +5,7 @@
 use core::time::Duration;
 use mls_rs_codec::{MlsDecode, MlsEncode, MlsSize};
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(target_os = "linux")))]
 use wasm_bindgen::prelude::*;
 
 /// Wasm-compatible representation of a timestamp.
@@ -61,7 +61,7 @@ impl core::ops::Add<Duration> for MlsTime {
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "std"))]
+#[cfg(all(any(not(target_arch = "wasm32"), target_os = "linux"), feature = "std"))]
 impl MlsTime {
     /// Current system time.
     pub fn now() -> Self {
@@ -94,13 +94,13 @@ impl From<MlsTime> for Duration {
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "std"))]
+#[cfg(all(any(not(target_arch = "wasm32"), target_os = "linux"), feature = "std"))]
 #[derive(Debug, thiserror::Error)]
 #[error("Overflow while adding {0:?}")]
 /// Overflow in time conversion.
 pub struct TimeOverflow(Duration);
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "std"))]
+#[cfg(all(any(not(target_arch = "wasm32"), target_os = "linux"), feature = "std"))]
 impl TryFrom<MlsTime> for std::time::SystemTime {
     type Error = TimeOverflow;
 
@@ -112,7 +112,7 @@ impl TryFrom<MlsTime> for std::time::SystemTime {
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "std"))]
+#[cfg(all(any(not(target_arch = "wasm32"), target_os = "linux"), feature = "std"))]
 impl TryFrom<std::time::SystemTime> for MlsTime {
     type Error = std::time::SystemTimeError;
 
@@ -122,7 +122,7 @@ impl TryFrom<std::time::SystemTime> for MlsTime {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+#[cfg(all(target_arch = "wasm32", not(any(target_os = "emscripten", target_os = "linux"))))]
 #[wasm_bindgen(inline_js = r#"
 export function date_now() {
   return Date.now();
@@ -137,7 +137,7 @@ extern "C" {
     fn date_now() -> f64;
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(target_os = "linux")))]
 impl MlsTime {
     pub fn now() -> Self {
         Self {

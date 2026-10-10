@@ -228,6 +228,9 @@ if CONFIG["OS_ARCH"] == "Linux" and CONFIG["TARGET_CPU"] == "loongarch64":
         "xptcstubs_loongarch64.cpp",
     ]
 
+if CONFIG["TARGET_CPU"] == "wasm32" and CONFIG["OS_ARCH"] == "Linux":
+    SOURCES += ["xptcall_wasm32.cpp"]
+
 FINAL_LIBRARY = "xul"
 
 LOCAL_INCLUDES += [

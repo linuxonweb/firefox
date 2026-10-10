@@ -476,6 +476,9 @@ AddOidToSequence(CERTOidSequence *os, SECOidTag oidTag)
 
 SEC_ASN1_MKSUB(SEC_ObjectIDTemplate)
 
+#if defined(__linux__) && defined(__wasm__) && !defined(__wasi__)
+#define CERT_OidSeqTemplate certutil_WasmOidSeqTemplate
+#endif
 const SEC_ASN1Template CERT_OidSeqTemplate[] = {
     { SEC_ASN1_SEQUENCE_OF | SEC_ASN1_XTRN, offsetof(CERTOidSequence, oids),
       SEC_ASN1_SUB(SEC_ObjectIDTemplate) }

@@ -17,7 +17,10 @@ DIRS += ['bsf']
 
 LOCAL_INCLUDES += ['/modules/fdlibm/inexact-math-override']
 
-SharedLibrary('mozavcodec')
+if CONFIG["TARGET_CPU"] == "wasm32":
+    Library("mozavcodec")
+else:
+    SharedLibrary('mozavcodec')
 SOURCES += [
     'adts_header.c',
     'adts_parser.c',
@@ -195,7 +198,8 @@ else:
   CXXFLAGS += CONFIG["MOZ_LIBVPX_CFLAGS"]
   OS_LIBS += CONFIG["MOZ_LIBVPX_LIBS"]
 
-SYMBOLS_FILE = 'avcodec.symbols'
+if CONFIG["TARGET_CPU"] != "wasm32":
+    SYMBOLS_FILE = 'avcodec.symbols'
 NoVisibilityFlags()
 
 USE_LIBS += [

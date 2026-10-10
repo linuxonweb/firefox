@@ -25,9 +25,12 @@ if CONFIG["MOZ_SYSTEM_NSS"]:
 
 include("/build/gyp_base.mozbuild")
 if CONFIG["MOZ_FOLD_LIBS"]:
-    GeckoSharedLibrary("nss")
-    # TODO: The library name can be changed when bug 845217 is fixed.
-    SHARED_LIBRARY_NAME = "nss3"
+    if CONFIG["TARGET_CPU"] == "wasm32":
+        Library("nss")
+    else:
+        GeckoSharedLibrary("nss")
+        # TODO: The library name can be changed when bug 845217 is fixed.
+        SHARED_LIBRARY_NAME = "nss3"
 
     USE_LIBS += [
         "nspr4",
@@ -41,10 +44,12 @@ if CONFIG["MOZ_FOLD_LIBS"]:
 
     OS_LIBS += CONFIG["REALTIME_LIBS"]
 
-    SYMBOLS_FILE = "nss.symbols"
+    if CONFIG["TARGET_CPU"] != "wasm32":
+        SYMBOLS_FILE = "nss.symbols"
     # This changes the default targets in the NSS build, among
     # other things.
     gyp_vars["moz_fold_libs"] = 1
+    gyp_vars["wasm_static"] = int(CONFIG["TARGET_CPU"] == "wasm32")
     # Some things in NSS need to link against nssutil, which
     # gets folded, so this tells them what to link against.
     gyp_vars["moz_folded_library_name"] = "nss"

@@ -28,12 +28,22 @@
         'nss_static',
         '<(DEPTH)/lib/certhigh/certhigh.gyp:certhi',
         '<(DEPTH)/lib/cryptohi/cryptohi.gyp:cryptohi',
-        '<(DEPTH)/lib/pk11wrap/pk11wrap.gyp:pk11wrap',
         '<(DEPTH)/lib/certdb/certdb.gyp:certdb',
         '<(DEPTH)/lib/pki/pki.gyp:nsspki',
         '<(DEPTH)/lib/dev/dev.gyp:nssdev',
         '<(DEPTH)/lib/base/base.gyp:nssb',
         '<(DEPTH)/lib/libpkix/libpkix.gyp:libpkix',
+      ],
+      'conditions': [
+        [ 'wasm_static==1', {
+          'dependencies': [
+            '<(DEPTH)/lib/pk11wrap/pk11wrap.gyp:pk11wrap_static',
+          ],
+        }, {
+          'dependencies': [
+            '<(DEPTH)/lib/pk11wrap/pk11wrap.gyp:pk11wrap',
+          ],
+        }],
       ],
     },
     {

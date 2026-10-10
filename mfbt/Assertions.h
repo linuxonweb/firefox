@@ -14,7 +14,7 @@
 #endif
 
 #if (defined(MOZ_HAS_MOZGLUE) || defined(MOZILLA_INTERNAL_API)) && \
-    !defined(__wasi__)
+    !defined(__wasi__) && !defined(__wasm__)
 #  define MOZ_DUMP_ASSERTION_STACK
 #endif
 #if defined(XP_WIN) && (defined(DEBUG) || defined(FUZZING))

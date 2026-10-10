@@ -8,8 +8,11 @@
 #
 # Any library added here should also be reflected in the about:license page.
 
-GeckoSharedLibrary("lgpllibs")
-SHARED_LIBRARY_NAME = "lgpllibs"
+if CONFIG["TARGET_CPU"] == "wasm32":
+    Library("lgpllibs")
+else:
+    GeckoSharedLibrary("lgpllibs")
+    SHARED_LIBRARY_NAME = "lgpllibs"
 
 # For some reason, mingw builds export way too many symbols.
 if CONFIG["TARGET_OS"] == "WINNT" and CONFIG["CC_TYPE"] != "clang-cl":

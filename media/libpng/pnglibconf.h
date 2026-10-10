@@ -731,3 +731,7 @@
 #endif
 
 #endif /* PNGLCONF_H */
+
+#if defined(__wasm__) && defined(__linux__) && !defined(__wasi__)
+#  include "NightlyPngStaticNames.h"
+#endif

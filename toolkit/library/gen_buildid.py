@@ -9,9 +9,12 @@ import buildconfig
 from variables import get_buildid
 
 
-def main(output, input_file):
-    with open(input_file) as fh:
-        objs = [l.strip() for l in fh.readlines()]
+def main(output, input_file=None):
+    if input_file:
+        with open(input_file) as fh:
+            objs = [l.strip() for l in fh.readlines()]
+    else:
+        objs = []
 
     write_file(output, None)
 

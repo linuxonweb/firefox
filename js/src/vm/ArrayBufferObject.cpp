@@ -17,7 +17,7 @@
 #include <string.h>
 
 #include "vm/ArrayBufferObject-inl.h"
-#if !defined(XP_WIN) && !defined(__wasi__)
+#if !defined(XP_WIN) && !defined(__wasi__) && !defined(__wasm__)
 #  include <sys/mman.h>
 #endif
 #include <tuple>  // std::tuple
@@ -204,7 +204,7 @@ void* js::MapBufferMemory(wasm::AddressType t, wasm::PageSize pageSize,
   }
 
   gc::RecordMemoryAlloc(initialCommittedSize);
-#elif defined(__wasi__)
+#elif defined(__wasi__) || defined(__wasm__)
   void* data = nullptr;
   if (int err = posix_memalign(&data, gc::SystemPageSize(), mappedSize)) {
     MOZ_ASSERT(err == ENOMEM);
@@ -249,7 +249,7 @@ bool js::CommitBufferMemory(void* dataEnd, size_t delta) {
   if (!VirtualAlloc(dataEnd, delta, MEM_COMMIT, PAGE_READWRITE)) {
     return false;
   }
-#elif defined(__wasi__)
+#elif defined(__wasi__) || defined(__wasm__)
   // posix_memalign'd memory is already committed
   return true;
 #else
@@ -276,7 +276,7 @@ void js::UnmapBufferMemory(wasm::AddressType t, void* base, size_t mappedSize,
 #ifdef XP_WIN
   VirtualFree(base, 0, MEM_RELEASE);
   gc::RecordMemoryFree(committedSize);
-#elif defined(__wasi__)
+#elif defined(__wasi__) || defined(__wasm__)
   free(base);
   (void)committedSize;
 #else
@@ -1594,7 +1594,7 @@ void WasmArrayRawBuffer::discard(size_t byteOffset, size_t byteLen) {
   if (!VirtualAlloc(addr, byteLen, MEM_COMMIT, PAGE_READWRITE)) {
     MOZ_CRASH("wasm discard: decommitted memory but failed to recommit");
   };
-#elif defined(__wasi__)
+#elif defined(__wasi__) || defined(__wasm__)
   memset(addr, 0, byteLen);
 #else  // !XP_WIN
   void* data = MozTaggedAnonymousMmap(addr, byteLen, PROT_READ | PROT_WRITE,

@@ -31,10 +31,8 @@ DIRS += [
     "driftcontrol",
     "eme",
     "encoder",
-    "fake-cdm",
     "flac",
     "gmp",
-    "gmp-plugin-openh264",
     "imagecapture",
     "ipc",
     "mediacapabilities",
@@ -56,6 +54,9 @@ DIRS += [
     "webrtc",
     "webvtt",
 ]
+
+if CONFIG["TARGET_CPU"] != "wasm32":
+    DIRS += ["fake-cdm", "gmp-plugin-openh264"]
 
 if CONFIG["MOZ_ANDROID_HLS_SUPPORT"]:
     DIRS += ["hls"]

@@ -7,6 +7,9 @@ EXPORTS += [
     'pixman.h',
 ]
 
+if CONFIG["OS_ARCH"] == "Linux" and CONFIG["TARGET_CPU"] == "wasm32":
+    EXPORTS += ["NightlyPixmanStaticNames.h"]
+
 SOURCES += [
     'pixman-access-accessors.c',
     'pixman-access.c',

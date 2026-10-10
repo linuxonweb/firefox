@@ -69,7 +69,9 @@ if CONFIG["MOZ_WASM_SANDBOXING_SOUNDTOUCH"]:
     soundtouch_defines = WASM_DEFINES
 
 else:
-    SOURCES += ["/config/external/rlbox/rlbox_thread_locals.cpp"]
+    # The native static browser already owns this shared RLBox TLS storage.
+    if not (CONFIG["OS_ARCH"] == "Linux" and CONFIG["TARGET_CPU"] == "wasm32"):
+        SOURCES += ["/config/external/rlbox/rlbox_thread_locals.cpp"]
     if CONFIG['INTEL_ARCHITECTURE']:
         if CONFIG['MOZ_SAMPLE_TYPE_FLOAT32']:
             SOURCES += ['sse_optimized.cpp']

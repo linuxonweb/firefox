@@ -164,9 +164,10 @@ if (
 ):
     DIRS += ["/testing/geckodriver"]
 
-DIRS += [
-    "/media/gmp-clearkey/0.1",
-]
+if CONFIG["TARGET_CPU"] != "wasm32":
+    DIRS += [
+        "/media/gmp-clearkey/0.1",
+    ]
 
 if CONFIG["MOZ_WMF_CDM"] and CONFIG["ENABLE_TESTS"]:
     DIRS += [

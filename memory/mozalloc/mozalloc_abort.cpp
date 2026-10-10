@@ -77,12 +77,16 @@ void fillAbortMessage(char (&msg)[N], uintptr_t retAddress) {
 // UndefinedBehaviorSanitizer runtime which also requires the same workaround
 // as with ASan or TSan.
 extern "C" void abort(void) {
-#  ifdef MOZ_WIDGET_ANDROID
+#  if defined(__linux__) && defined(__wasm__) && !defined(__wasi__)
+  // Linear address zero may be writable. Terminate without re-entering MOZ_CRASH.
+  __builtin_trap();
+#  else
+#    ifdef MOZ_WIDGET_ANDROID
   char msg[64] = {};
   fillAbortMessage(msg, uintptr_t(__builtin_return_address(0)));
-#  else
+#    else
   const char* const msg = "Redirecting call to abort() to mozalloc_abort\n";
-#  endif
+#    endif
 
   mozalloc_abort(msg);
 
@@ -91,5 +95,6 @@ extern "C" void abort(void) {
   // unreachable marker here to avoid a "'noreturn' function does return"
   // warning.
   MOZ_ASSUME_UNREACHABLE_MARKER();
+#  endif
 }
 #endif

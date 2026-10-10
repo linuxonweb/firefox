@@ -46,7 +46,7 @@ void SetCloseOnExec(detail::FileHandleType aFile) {
 }
 #endif
 
-#ifndef __wasm__
+#if !defined(__wasm__) || (defined(XP_LINUX) && !defined(__wasi__))
 UniqueFileHandle DuplicateFileHandle(detail::FileHandleType aFile) {
   if (FileHandleIsValid(aFile)) {
 #  ifdef XP_WIN

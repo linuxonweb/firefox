@@ -1,4 +1,4 @@
-node: bf9757d91e2e53b8ab836f2a08bf4c0275fdcd23
-node-date: 2026-10-02T21:18:24Z
-describe-name: 
-ref-names: grafted, HEAD
+node: 26a129b91bc2428191eb5b9dbaaab803601fa414
+node-date: 2026-10-02T09:49:54Z
+describe-name: FIREFOX_BETA_158_BASE-1792-g26a129b91bc24
+ref-names: HEAD -> main

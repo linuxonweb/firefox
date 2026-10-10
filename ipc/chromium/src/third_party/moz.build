@@ -42,7 +42,8 @@ if CONFIG["TARGET_KERNEL"] == "Linux":
     UNIFIED_SOURCES += [
         'libevent/epoll.c',
     ]
-    if CONFIG['OS_TARGET'] != 'Android':
+    if CONFIG['OS_TARGET'] != 'Android' and not (CONFIG["OS_ARCH"] == "Linux" and CONFIG["TARGET_CPU"] == "wasm32"):
+        # Native musl already provides epoll_create/ctl/wait.
         UNIFIED_SOURCES += [
             'libevent/epoll_sub.c',
         ]

@@ -19,6 +19,8 @@ def Libxul(name, output_category=None):
         # "libxul.dylib"
         GeckoFramework(name, output_category=output_category)
         SHARED_LIBRARY_NAME = "XUL"
+    elif CONFIG["TARGET_CPU"] == "wasm32":
+        Library(name)
     else:
         GeckoSharedLibrary(name, output_category=output_category)
         SHARED_LIBRARY_NAME = "xul"
@@ -100,7 +102,7 @@ def Libxul(name, output_category=None):
     if CONFIG["RUSTC_NATVIS_LDFLAGS"]:
         LDFLAGS += CONFIG["RUSTC_NATVIS_LDFLAGS"]
 
-    if name == "xul-real":
+    if name == "xul-real" and CONFIG["TARGET_CPU"] != "wasm32":
         SYMBOLS_FILE = "../libxul.symbols"
 
     # Disable full lto for xul-gtest, it takes a lot of time with no clear
@@ -408,10 +410,19 @@ if CONFIG["COMPILE_ENVIRONMENT"]:
             CONFIG["DLL_PREFIX"],
             CONFIG["DLL_SUFFIX"].lstrip(".").replace(".", "_"),
         )
-    GeneratedFile(
-        "buildid.cpp", script="gen_buildid.py", inputs=["!build/%s.list" % libxul_list]
-    )
+    if CONFIG["TARGET_CPU"] == "wasm32":
+        GeneratedFile("buildid.cpp", script="gen_buildid.py")
+    else:
+        GeneratedFile(
+            "buildid.cpp", script="gen_buildid.py", inputs=["!build/%s.list" % libxul_list]
+        )
 
     EXPORTS += [
         "buildid_section.h",
     ]
+
+if CONFIG["TARGET_CPU"] == "wasm32":
+    OS_LIBS += ['epoxy', 'Xi', 'Xrandr', 'Xcursor', 'Xcomposite', 'Xdamage', 'Xinerama', 'Xfixes', 'Xrender', 'Xext', 'X11', 'xcb', 'Xau', 'expat']
+
+if CONFIG["OS_ARCH"] == "Linux" and CONFIG["TARGET_CPU"] == "wasm32":
+    USE_LIBS += ["mozinference"]

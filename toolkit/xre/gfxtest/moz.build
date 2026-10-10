@@ -29,6 +29,9 @@ OS_LIBS += CONFIG["MOZ_X11_LIBS"]
 OS_LIBS += CONFIG["MOZ_GTK3_LIBS"]
 OS_LIBS += CONFIG["DL_LIBS"]
 
+if CONFIG["TARGET_CPU"] == "wasm32":
+    OS_LIBS += ["Xau"]
+
 if CONFIG["MOZ_ASAN"] or CONFIG["MOZ_UBSAN"] or CONFIG["MOZ_TSAN"]:
     USE_LIBS += ["sanitizer-options"]
 

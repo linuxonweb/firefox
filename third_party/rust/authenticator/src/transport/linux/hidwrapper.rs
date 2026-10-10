@@ -55,3 +55,6 @@ include!("ioctl_loongarch64.rs");
 
 #[cfg(all(target_arch = "sparc64", target_endian = "big"))]
 include!("ioctl_sparc64.rs");
+
+#[cfg(all(target_arch = "wasm32", target_os = "linux", target_env = "musl"))]
+include!("ioctl_wasm32.rs");

@@ -22,6 +22,19 @@
 #include "XPCJSMemoryReporter.h"
 #include "xpcprivate.h"
 #include "xpcpublic.h"
+#if defined(__wasm__) && !defined(__wasi__) && defined(ENABLE_PORTABLE_BASELINE_INTERP)
+#  include "jsapi.h"
+#  include <atomic>
+#  include <stdio.h>
+#  include <stdlib.h>
+#  include <pthread.h>
+#  include <sys/syscall.h>
+#  include <unistd.h>
+namespace js { namespace pbljit {
+void PrintObservation(const char* failure, const char* format, ...)
+    __attribute__((format(printf, 2, 3)));
+} }
+#endif
 #include "XPCSelfHostedShmem.h"
 #include "XPCWrapper.h"
 #ifdef FUZZING
@@ -896,6 +909,42 @@ static void LoadStartupJSPrefs(XPCJSContext* xpccx) {
   JS_SetGlobalJitCompilerOption(
       cx, JSJITCOMPILER_BASELINE_INTERPRETER_ENABLE,
       StaticPrefs::javascript_options_blinterp_DoNotUseDirectly());
+
+#if defined(__wasm__) && defined(ENABLE_PORTABLE_BASELINE_INTERP)
+#  if defined(__wasi__) || !defined(JS_CODEGEN_NONE)
+#    error "Linux/wasm browser PBL requires the real guest threading ABI"
+#  endif
+  // PBL has no browser pref setter upstream. Avoid FORCE and zero-threshold.
+  // Restart-only tier selection also controls the shared process-wide option
+  // inherited by new JS contexts, including Workers.
+  bool enablePortableBaseline = !safeMode &&
+      Preferences::GetBool(JS_OPTIONS_DOT_STR "portable_baseline", true);
+  JS_SetGlobalJitCompilerOption(cx, JSJITCOMPILER_PORTABLE_BASELINE_ENABLE,
+                                enablePortableBaseline ? 1 : 0);
+  JS_SetGlobalJitCompilerOption(cx, JSJITCOMPILER_PORTABLE_BASELINE_WARMUP_THRESHOLD,
+                                10);
+#if defined(__wasm__) && !defined(__wasi__) && defined(ENABLE_PORTABLE_BASELINE_INTERP)
+  // Opt-in initialization diagnostic, outside any generated-module hot hook.
+  static std::atomic<unsigned> optionObservationCount{0};
+  const char* observePortable = getenv("PBLJIT_OBSERVE");
+  if (observePortable && observePortable[0] == '1' && observePortable[1] == '\0') {
+    unsigned optionObservationIndex = optionObservationCount.fetch_add(1, std::memory_order_relaxed);
+    if (optionObservationIndex == 64)
+      js::pbljit::PrintObservation("PBLJIT_OPTION_EXHAUSTED reason=emission-failed\n", "PBLJIT_OPTION_EXHAUSTED event=startup budget=64 pid=%ld\n", static_cast<long>(getpid()));
+    if (optionObservationIndex < 64) {
+    uint32_t actualPortable = 0, actualWarmup = 0;
+    bool gotPortable = JS_GetGlobalJitCompilerOption(cx,
+        JSJITCOMPILER_PORTABLE_BASELINE_ENABLE, &actualPortable);
+    bool gotWarmup = JS_GetGlobalJitCompilerOption(cx,
+        JSJITCOMPILER_PORTABLE_BASELINE_WARMUP_THRESHOLD, &actualWarmup);
+    js::pbljit::PrintObservation("PBLJIT_OPTION_EXHAUSTED reason=emission-failed\n", "PBLJIT_OPTION event=startup pid=%ld tid=%ld pthread=%lu option=%u threshold=%u available=%u pref=%u safemode=%u\n",
+        static_cast<long>(getpid()), syscall(SYS_gettid),
+        static_cast<unsigned long>((uintptr_t)pthread_self()),
+        actualPortable, actualWarmup, unsigned(gotPortable && gotWarmup), unsigned(Preferences::GetBool(JS_OPTIONS_DOT_STR "portable_baseline", true)), unsigned(safeMode));
+    }
+  }
+#endif
+#endif
 
   // Disable most JITs in Safe-Mode.
   if (safeMode) {

@@ -1082,6 +1082,7 @@ s! {
                 target_arch = "sparc",
                 target_arch = "x86_64",
                 target_arch = "x86",
+                target_arch = "wasm32",
             )
         ),
         repr(align(4))
@@ -1100,6 +1101,7 @@ s! {
                 target_arch = "sparc",
                 target_arch = "x86_64",
                 target_arch = "x86",
+                target_arch = "wasm32",
             ))
         ),
         repr(align(8))
@@ -1122,7 +1124,8 @@ s! {
                 target_arch = "powerpc",
                 target_arch = "sparc",
                 target_arch = "x86_64",
-                target_arch = "x86"
+                target_arch = "x86",
+                target_arch = "wasm32"
             )
         ),
         repr(align(4))
@@ -1139,7 +1142,8 @@ s! {
                 target_arch = "powerpc",
                 target_arch = "sparc",
                 target_arch = "x86_64",
-                target_arch = "x86"
+                target_arch = "x86",
+                target_arch = "wasm32"
             ))
         ),
         repr(align(8))

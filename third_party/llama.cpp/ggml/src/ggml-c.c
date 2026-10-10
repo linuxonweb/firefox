@@ -78,7 +78,7 @@ uint64_t ggml_graph_next_uid(void) {
 #endif // defined(_MSC_VER)
 #endif // defined(__AVX512BF16__)
 
-#if defined(__linux__) || \
+#if (defined(__linux__) && !(defined(__wasm__) && !defined(__wasi__))) || \
     defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || \
     (defined(__APPLE__) && !TARGET_OS_TV && !TARGET_OS_WATCH)
 

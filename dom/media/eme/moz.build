@@ -48,7 +48,8 @@ if CONFIG["MOZ_WIDGET_TOOLKIT"] == "android":
 if CONFIG["MOZ_WMF_CDM"]:
     DIRS += ["mediafoundation"]
 
-DIRS += ["clearkey"]
+if CONFIG["TARGET_CPU"] != "wasm32":
+    DIRS += ["clearkey"]
 
 include("/ipc/chromium/chromium-config.mozbuild")
 

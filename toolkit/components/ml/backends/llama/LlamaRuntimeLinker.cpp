@@ -11,6 +11,7 @@
 #include "nsXPCOMPrivate.h"
 #include "nsXULAppAPI.h"
 #include "prlink.h"
+#include "NightlyStaticInference.h"
 
 #ifdef XP_WIN
 #  include <windows.h>
@@ -56,6 +57,9 @@ static void LlamaLogCallback(ggml_log_level aLevel, const char* aText,
 }
 
 static PRLibrary* LoadLlamaLib(nsIFile* aFile) {
+#if defined(__linux__) && defined(__wasm__) && !defined(__wasi__)
+  return NightlyLoadStaticInference();
+#else
   PRLibSpec lspec;
   PathString path = aFile->NativePath();
 #ifdef XP_WIN
@@ -94,6 +98,7 @@ static PRLibrary* LoadLlamaLib(nsIFile* aFile) {
 #endif
   }
   return lib;
+#endif
 }
 
 LlamaLibWrapper::LinkResult LlamaLibWrapper::Link() {
@@ -148,6 +153,9 @@ bool LlamaRuntimeLinker::Init() {
 
   sLinkStatus = LinkStatus_FAILED;
 
+#if defined(__linux__) && defined(__wasm__) && !defined(__wasi__)
+  sLlamaLib.mLlamaLib = LoadLlamaLib(nullptr);
+#else
   // Get the path to the current executable/library
 #ifdef XP_WIN
   PathString path =
@@ -193,6 +201,7 @@ bool LlamaRuntimeLinker::Init() {
       libFile->HumanReadablePath().get());
 
   sLlamaLib.mLlamaLib = LoadLlamaLib(libFile);
+#endif
   if (!sLlamaLib.mLlamaLib) {
     LOG(LogLevel::Error, "Failed to load llama library");
     return false;

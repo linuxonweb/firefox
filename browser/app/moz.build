@@ -108,7 +108,9 @@ if CONFIG["MOZ_MACBUNDLE_NAME"]:
     DIRS += ["macbuild/Contents"]
 
 browser_linkage = "standalone"
-if CONFIG["FUZZING_SNAPSHOT"] or CONFIG["AFLFUZZ"]:
+if CONFIG["TARGET_CPU"] == "wasm32":
+    browser_linkage = "dependent"
+elif CONFIG["FUZZING_SNAPSHOT"] or CONFIG["AFLFUZZ"]:
     browser_linkage = "dependent"
 
 if CONFIG["MOZ_NO_PIE_COMPAT"]:

@@ -127,7 +127,10 @@ _PR_InitLinker(void)
 
 #elif defined(XP_UNIX)
 #ifdef HAVE_DLL
-#if defined(USE_DLFCN) && !defined(NO_DLOPEN_NULL)
+#if defined(__linux__) && defined(__wasm__) && !defined(__wasi__)
+    /* Native Wasm is statically linked; retain the NO_DLOPEN_NULL strategy. */
+    h = NULL;
+#elif defined(USE_DLFCN) && !defined(NO_DLOPEN_NULL)
     h = dlopen(0, RTLD_LAZY);
     if (!h) {
         char* error;
@@ -633,7 +636,14 @@ PR_UnloadLibrary(PRLibrary* lib)
 #ifdef XP_UNIX
 #ifdef HAVE_DLL
 #ifdef USE_DLFCN
+#if defined(__linux__) && defined(__wasm__) && !defined(__wasi__)
+    /* Registered static tables have no dynamic loader handle to release. */
+    if (!lib->staticTable) {
+        result = dlclose(lib->dlh);
+    }
+#else
     result = dlclose(lib->dlh);
+#endif
 #elif defined(USE_HPSHL)
     result = shl_unload(lib->dlh);
 #else

@@ -31,6 +31,9 @@
     rv = SECFailure; \
     break;
 
+#if defined(__linux__) && defined(__wasm__) && !defined(__wasi__)
+#define SECKEY_PQGParamsTemplate certutil_WasmPQGParamsTemplate
+#endif
 const SEC_ASN1Template SECKEY_PQGParamsTemplate[] = {
     { SEC_ASN1_SEQUENCE, 0, NULL, sizeof(SECKEYPQGParams) },
     { SEC_ASN1_INTEGER, offsetof(SECKEYPQGParams, prime) },

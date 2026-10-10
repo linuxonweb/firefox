@@ -17,7 +17,11 @@ fn main() {
             all(target_vendor = "apple", feature = "angle") // ANGLE on Apple
         ) },
         vulkan: { any(
-            all(windows_linux_android, feature = "vulkan"), // Regular Vulkan
+            all(
+                windows_linux_android,
+                feature = "vulkan",
+                not(all(target_arch = "wasm32", target_os = "linux", target_env = "musl"))
+            ), // Regular Vulkan
             all(target_vendor = "apple", feature = "vulkan-portability") // Vulkan Portability on Apple
         ) },
         drm: { all(

@@ -587,7 +587,8 @@ def split_triplet(triplet, allow_wasi=False):
     elif cpu == "sh4":
         canonical_cpu = "sh4"
         endianness = "little"
-    elif cpu == "wasm32" and allow_wasi:
+    elif cpu == "wasm32":
+        # Allow wasm32-*-linux-* (tombl) as well as wasm32-*-wasi.
         canonical_cpu = "wasm32"
         endianness = "little"
     else:
@@ -758,7 +759,10 @@ def real_target(value, host, shell, project, application):
             pass
 
     try:
-        return split_triplet(config_sub(shell, target), allow_wasi=(project == "js"))
+        # project=js historically gated wasm32; also allow browser on wasm32-linux.
+        return split_triplet(
+            config_sub(shell, target), allow_wasi=(project == "js" or "wasm32" in target)
+        )
     except ValueError as e:
         die(e)
 

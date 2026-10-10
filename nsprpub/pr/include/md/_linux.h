@@ -74,6 +74,8 @@
 #define _PR_SI_ARCHITECTURE "xtensa"
 #elif defined(__loongarch64)
 #define _PR_SI_ARCHITECTURE "loongarch64"
+#elif defined(__wasm32__) || defined(__wasm__)
+#define _PR_SI_ARCHITECTURE "wasm32"
 #else
 #error "Unknown CPU architecture"
 #endif

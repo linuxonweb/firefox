@@ -24,5 +24,10 @@ MOZ_EXPORT void mozgtk_linker_holder() { gdk_display_get_default(); }
 // This is also used to force libxul to depend on the mozgtk library. If we
 // ever can remove this workaround for system Cairo, we'll need something
 // to replace it for that purpose.
+#if defined(__wasm__) && defined(__linux__) && !defined(__wasi__)
+// Static linking needs a wrapper in place of ELF load-order interposition.
+MOZ_EXPORT Bool __wrap_XShmQueryExtension(Display* aDisplay) { return False; }
+#else
 MOZ_EXPORT Bool XShmQueryExtension(Display* aDisplay) { return False; }
+#endif
 #endif

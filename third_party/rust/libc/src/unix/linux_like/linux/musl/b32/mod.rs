@@ -43,6 +43,9 @@ cfg_if! {
     } else if #[cfg(any(target_arch = "riscv32"))] {
         mod riscv32;
         pub use self::riscv32::*;
+    } else if #[cfg(target_arch = "wasm32")] {
+        mod wasm32;
+        pub use self::wasm32::*;
     } else {
         // Unknown target_arch
     }

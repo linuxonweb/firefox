@@ -234,6 +234,14 @@ ForkAndExec(const char* path, char* const* argv,
             close(fd_map[2]);
         }
     }
+#elif defined(__wasm__) && defined(__linux__)
+    /* Native Wasm cannot fork an independent browser address space. */
+    PR_DELETE(process);
+    if (newEnvp) {
+        PR_DELETE(newEnvp);
+    }
+    PR_SetError(PR_NOT_IMPLEMENTED_ERROR, 0);
+    return NULL;
 #else
     process->md.pid = fork();
 #endif

@@ -55,7 +55,14 @@ Result<Ok, LaunchError> LaunchApp(const std::vector<std::string>& argv,
   }
 #else
   struct {
+#  if defined(__wasm__) && defined(__linux__)
+    pid_t Fork() {
+      errno = ENOSYS;
+      return -1;
+    }
+#  else
     pid_t Fork() { return fork(); }
+#  endif
   } launcher;
 #endif
 

@@ -35,7 +35,18 @@ NS_GetXPTCallStub(REFNSIID aIID, nsIXPTCProxy* aOuter,
     return NS_ERROR_FAILURE;
   }
 
+#if defined(__wasm__) && defined(__linux__) && !defined(__wasi__)
+  *aResult = nullptr;
+  auto* stub = new nsXPTCStubBase(aOuter, iie);
+  nsresult rv = WasmInitXPTCStub(stub);
+  if (NS_FAILED(rv)) {
+    delete stub;
+    return rv;
+  }
+  *aResult = stub;
+#else
   *aResult = new nsXPTCStubBase(aOuter, iie);
+#endif
   return NS_OK;
 }
 
@@ -50,5 +61,10 @@ NS_SizeOfIncludingThisXPTCallStub(const nsISomeInterface* aStub,
                                   mozilla::MallocSizeOf aMallocSizeOf) {
   // We could cast aStub to nsXPTCStubBase, but that class doesn't seem to own
   // anything, so just measure the size of the object itself.
+#if defined(__wasm__) && defined(__linux__) && !defined(__wasi__)
+  return aMallocSizeOf(aStub) +
+         aMallocSizeOf(static_cast<const nsXPTCStubBase*>(aStub)->mWasmVTable);
+#else
   return aMallocSizeOf(aStub);
+#endif
 }

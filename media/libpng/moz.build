@@ -92,6 +92,9 @@ if CONFIG['TARGET_CPU'] == 'riscv64':
 if CONFIG['MOZ_TREE_FREETYPE']:
     DEFINES['FT_CONFIG_OPTION_USE_PNG'] = True
 
+if CONFIG["OS_ARCH"] == "Linux" and CONFIG["TARGET_CPU"] == "wasm32":
+    EXPORTS += ["NightlyPngStaticNames.h"]
+
 Library('mozpng')
 
 FINAL_LIBRARY = 'xul'

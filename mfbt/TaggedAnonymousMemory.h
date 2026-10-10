@@ -31,7 +31,7 @@
 
 #ifndef XP_WIN
 
-#  ifdef __wasi__
+#  if defined(__wasi__) || (defined(__wasm__) && !defined(__linux__))
 #    include <stdlib.h>
 #  else
 #    include <sys/mman.h>
@@ -40,7 +40,7 @@
 
 #  include "mozilla/Types.h"  // IWYU pragma: keep(MFBT_API)
 
-#  ifdef XP_LINUX
+#  if defined(XP_LINUX) && !defined(__wasm__)
 
 #    ifdef __cplusplus
 extern "C" {

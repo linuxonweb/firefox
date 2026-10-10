@@ -129,6 +129,8 @@ if CONFIG["ENABLE_PORTABLE_BASELINE_INTERP"]:
     SOURCES += [
         "PortableBaselineInterpret.cpp",
     ]
+    if CONFIG["OS_ARCH"] == "Linux" and CONFIG["TARGET_CPU"] == "wasm32":
+        SOURCES += ["PblJit.cpp"]
 
 if CONFIG["FUZZING_INTERFACES"] and CONFIG["LIBFUZZER"]:
     # In addition to regular coverage provided by trace-pc-guard,
