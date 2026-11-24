@@ -6,9 +6,10 @@
 // beside a copy of it whose CASE(LoopHead) calls pbljit::OnLoopHead (see
 // tools/build-firefox-pbl-jit.py). Upstream SpiderMonkey files are unchanged.
 //
-// A hot innermost loop (LoopHead .. the last Goto/JumpIfTrue back to it, with
-// no nested loop) whose ops are all in the subset below is translated into one
-// wasm function (23 x i64) -> i64 and installed with the private jit_install
+// A hot loop (LoopHead .. its last backedge) whose ops are in the subset
+// below is translated into one wasm function. Properly nested numeric loops
+// up to depth three share that function; other nested shapes fail closed. The
+// function (23 x i64) -> i64 is installed with the private jit_install
 // syscall (docs/guest-jit-runtime-primitive-20260928.md). Values have static
 // types (Int32, Double, Boolean, undefined, null, the TDZ magic); frame locals
 // and unaliased formal arguments ("vars") and the PBL operand stack live in
@@ -24,10 +25,10 @@
 // numeric slots behind entry shape guards; tenured global/object constants
 // support hoisted identity guards and allocation-free Math operations.
 // Cache entries are invalidated on script/major-GC changes and skipped during
-// incremental GC. Vars read before
-// being written in an iteration are type-guarded at entry and must keep that
-// type around the loop; the others are reloaded from the frame each
-// iteration. The code leaves the loop at:
+// incremental GC. Vars read before being written are type-guarded at entry
+// and must keep a converged type at every loop header. Other vars are flushed
+// before a backedge forgets their types, and initialized before their next
+// use. The code leaves the loop at:
 //   - a jump out of the region (normal exit, e.g. the loop condition),
 //   - an int32 overflow / non-int result, or a double outside the int32 range
 //     of a bitwise op, *before* the op (PBL redoes it with exact semantics),
@@ -110,6 +111,10 @@ void PrintObservation(const char* failure, const char* format, ...) {
   if (written != ssize_t(strlen(failure))) abort();
 }
 
+void ObserveLocation(const char* filename, unsigned line, unsigned off, JSContext* cx,
+                     const char* event, uint32_t fn, int64_t kind = -1,
+                     uint32_t sp = 0, int32_t delta = 0, uint32_t ic = 0);
+
 struct Exit {
   uint64_t* sp;
   int32_t pcDelta;
@@ -127,6 +132,8 @@ constexpr uint32_t kMaxBails = 64;
 constexpr uint32_t kMaxRegion = 512;
 constexpr uint32_t kMaxVars = 32;  // locals + arguments
 constexpr uint32_t kMaxTargets = 32;
+constexpr uint32_t kMaxLoops = 8;
+constexpr uint32_t kMaxLoopNesting = 3;
 constexpr uint32_t kMaxDepth = 16;
 constexpr uint32_t kMaxInstalls = 4000;
 
@@ -148,6 +155,8 @@ struct Entry {
 
 thread_local Entry* tCache;
 
+#include "PblCacheObserve.h"
+
 uint32_t CacheIndex(JSScript* script, const jsbytecode* pc) {
   // Firefox shares immutable bytecode between scripts with different atoms.
   // Include the script so those scripts do not continually evict each other.
@@ -167,6 +176,7 @@ std::atomic<uint32_t> gRejects{0};
 std::atomic<uint32_t> gRuns{0};
 std::atomic<uint32_t> gBails{0};
 std::atomic<int> gLogBudget{-1};
+std::atomic<bool> gLogEnabled{false};
 std::atomic<int> gEnabled{-1};
 
 bool Enabled() {
@@ -175,16 +185,21 @@ bool Enabled() {
     const char* v = getenv("PBLJIT");
     e = (v && v[0] == '0') ? 0 : 1;
     const char* l = getenv("PBLJIT_LOG");
-    gLogBudget.store(l ? atoi(l) : 24, std::memory_order_relaxed);
+    const int logBudget = l ? atoi(l) : 24;
+    gLogBudget.store(logBudget, std::memory_order_relaxed);
+    gLogEnabled.store(logBudget > 0, std::memory_order_relaxed);
     gEnabled.store(e, std::memory_order_relaxed);
-    if (e) {
-      fprintf(stderr, "PBLJIT enabled (threshold=%u, logBudget=%d)\n", kCompileHits, l ? atoi(l) : 24);
+    if (e && logBudget > 0) {
+      fprintf(stderr, "PBLJIT enabled (threshold=%u, logBudget=%d)\n", kCompileHits, logBudget);
     }
   }
   return e != 0;
 }
 
-bool TakeLog() { return gLogBudget.fetch_sub(1, std::memory_order_relaxed) > 0; }
+bool TakeLog() {
+  return gLogEnabled.load(std::memory_order_relaxed) &&
+         gLogBudget.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
 
 // ---- wasm byte emitter ----------------------------------------------------
 
@@ -477,6 +492,19 @@ struct State {
   Ty var[kMaxVars];
 };
 
+// Lexically nested natural loops. The entry state is checked against every
+// compiled backedge, including a continue from a descendant loop.
+struct Loop {
+  jsbytecode* head = nullptr;
+  jsbytecode* end = nullptr;
+  uint32_t parent = 0, depth = 1, liveMask = 0, ic = 0;
+  State entry;
+};
+struct Label {
+  bool loop;
+  uint32_t index;
+};
+
 struct Compiler {
   JSScript* script;
   JSContext* cx = nullptr;
@@ -504,11 +532,16 @@ struct Compiler {
   size_t guardInsertion = 0;
   Ty elemTy[kMaxVars];  // for Array vars: Int, Double or Unknown
   uint32_t maxArg = 0;  // 1 + highest argument index used
-  // Forward jump targets inside the region, ascending. Each one is the end
-  // of a wasm block opened at the top of the loop body (innermost first).
+  // Forward targets, ascending. Each block opens inside its owning loop;
+  // ancestor exit blocks surround all descendant loops.
   uint32_t ntargets = 0;
   jsbytecode* targetPc[kMaxTargets];
   State targetSt[kMaxTargets];
+  uint32_t targetOwner[kMaxTargets];
+  uint32_t nloops = 0;
+  Loop loops[kMaxLoops] = {};
+  Label labels[kMaxTargets + kMaxLoops];
+  uint32_t nlabels = 0, nactive = 0, active[kMaxLoops];
   uint32_t firstOpen = 0;  // first target not yet reached
   State st;
   uint32_t maxDepth = 0, nops = 0, icIndex = 0, headIc = 0;
@@ -628,28 +661,75 @@ struct Compiler {
     code.put(W_RETURN);
   }
 
-  // Head-live variables stay in wasm locals with their head type across the
-  // backedge; head-dead ones are stored to the frame so the next iteration
-  // starts with them in the Head state again.
-  bool checkBackedge(jsbytecode* pc) {
+  int findLoop(const jsbytecode* pc) const {
+    for (uint32_t i = 0; i < nloops; i++)
+      if (loops[i].head == pc) return int(i);
+    return -1;
+  }
+  // Every explicit Wasm label is tracked; temporary IFs are passed as extra.
+  int labelDepth(bool loop, uint32_t index, uint32_t extra = 0) const {
+    for (uint32_t i = nlabels; i > 0; i--)
+      if (labels[i - 1].loop == loop && labels[i - 1].index == index)
+        return int(nlabels - i + extra);
+    return -1;
+  }
+  bool beginLoop(uint32_t i, jsbytecode* pc) {
+    Loop& l = loops[i];
+    if (st.live) {
+      if (st.depth) return reject("loop entry depth", pc);
+      for (uint32_t v = 0; v < nvars; v++) {
+        if (st.var[v] == Ty::Head && (l.liveMask >> v & 1))
+          return reject("loop entry read", pc);
+        if (nloops > 1 && st.var[v] != Ty::Head && !IsNum(st.var[v]))
+          return reject("nested variable type", pc);
+      }
+    }
+    l.entry = st;
+    active[nactive++] = i;
+    code.put(W_LOOP), code.put(W_VOID);
+    labels[nlabels++] = {true, i};
+    // Latest target is outermost so the earliest one closes first.
+    for (uint32_t j = ntargets; j > 0; j--) {
+      if (targetOwner[j - 1] != i) continue;
+      code.put(W_BLOCK), code.put(W_VOID);
+      labels[nlabels++] = {false, j - 1};
+    }
+    return true;
+  }
+  bool closeLoops(jsbytecode* pc) {
+    while (nactive && loops[active[nactive - 1]].end == pc) {
+      uint32_t i = active[--nactive];
+      if (!nlabels || !labels[nlabels - 1].loop || labels[nlabels - 1].index != i)
+        return reject("loop label", pc);
+      code.put(W_END);
+      nlabels--;
+    }
+    return true;
+  }
+  // Concrete header types must converge on every incoming backedge. A Head
+  // variable is dead at that header; flush its value before forgetting it.
+  bool checkBackedge(jsbytecode* pc, uint32_t i) {
     if (st.depth != 0) return reject("backedge depth", pc);
+    const State& entry = loops[i].entry;
+    if (!entry.live) return reject("loop entry", pc);
     bool same = true;
     for (uint32_t v = 0; v < nvars; v++) {
-      if (!varLive[v] || st.var[v] == headTy[v]) continue;
+      Ty t = entry.var[v];
+      if (t == Ty::Head || st.var[v] == t) continue;
       same = false;
-      if (mixed(st.var[v], headTy[v])) want.vars |= 1u << v;
+      if (mixed(st.var[v], t)) want.vars |= 1u << v;
     }
     return same || reject("backedge type", pc);
   }
-  // `nest` = enclosing structured blocks between here and the `loop`.
-  void emitBackedge(uint32_t nest) {
+  void emitBackedge(uint32_t i, uint32_t nest) {
+    const Loop& l = loops[i];
     lget(P_INTR);
     code.put(W_ATOMIC), code.put(W_I32ATOMICLOAD), code.uleb(2), code.uleb(0);
     code.put(W_IF), code.put(W_VOID);
-    emitExit(Interrupt, head, headIc);
+    emitExit(Interrupt, l.head, l.ic);
     code.put(W_END);
     for (uint32_t v = 0; v < nvars; v++) {
-      if (!varLive[v] && st.var[v] != Ty::Head) {
+      if (l.entry.var[v] == Ty::Head && st.var[v] != Ty::Head) {
         varAddr(v);
         boxStore(varLocal(v), st.var[v]);
       }
@@ -694,30 +774,89 @@ struct Compiler {
     return same || reject("join type", pc);
   }
 
-  // Pass 1: find the region (up to the last backedge before any nested
-  // loop), its frame variables and its forward jump targets.
+  // This first nested-loop tier deliberately excludes objects, arrays, calls,
+  // allocations, lexical checks and exception operations. Single-loop coverage
+  // remains unchanged. Booleans may be temporary comparison/branch operands.
+  static bool nestedOp(JSOp op) {
+    switch (op) {
+      case JSOp::LoopHead: case JSOp::JumpTarget:
+      case JSOp::Nop: case JSOp::NopIsAssignOp: case JSOp::DebugLeaveLexicalEnv:
+      case JSOp::Zero: case JSOp::One: case JSOp::Int8: case JSOp::Uint16:
+      case JSOp::Uint24: case JSOp::Int32: case JSOp::Double:
+      case JSOp::True: case JSOp::False:
+      case JSOp::GetLocal: case JSOp::SetLocal: case JSOp::InitLexical:
+      case JSOp::Pop: case JSOp::Dup: case JSOp::Dup2: case JSOp::Swap:
+      case JSOp::Add: case JSOp::Sub: case JSOp::Mul: case JSOp::Div: case JSOp::Mod:
+      case JSOp::BitOr: case JSOp::BitAnd: case JSOp::BitXor:
+      case JSOp::Lsh: case JSOp::Rsh: case JSOp::Ursh:
+      case JSOp::Eq: case JSOp::Ne: case JSOp::StrictEq: case JSOp::StrictNe:
+      case JSOp::Lt: case JSOp::Le: case JSOp::Gt: case JSOp::Ge:
+      case JSOp::Inc: case JSOp::Dec: case JSOp::Neg: case JSOp::BitNot:
+      case JSOp::Pos: case JSOp::ToNumeric: case JSOp::Not:
+      case JSOp::Goto: case JSOp::JumpIfFalse: case JSOp::JumpIfTrue:
+      case JSOp::And: case JSOp::Or:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // Pass 1: discover the outer region, all natural-loop intervals and edges.
+  // Requiring laminar intervals and header-only entry makes the lexical Wasm
+  // structure faithful to the bytecode CFG. Unsupported shapes never install.
   bool scan() {
     jsbytecode* body = head + JSOpLength_LoopHead;
     jsbytecode* limit = script->codeEnd();
     if (limit - head > int32_t(kMaxRegion)) limit = head + kMaxRegion;
     end = nullptr;
-    const char* stop = "region size";
     for (jsbytecode* pc = body; pc < limit;) {
       JSOp op = JSOp(*pc);
-      if (op == JSOp::LoopHead) {
-        stop = "nested loop";
-        break;
-      }
       jsbytecode* next = pc + GetBytecodeLength(pc);
-      if ((op == JSOp::Goto || op == JSOp::JumpIfTrue) &&
+      if (next > limit) break;
+      if ((op == JSOp::Goto || op == JSOp::JumpIfTrue || op == JSOp::JumpIfFalse) &&
           pc + GET_JUMP_OFFSET(pc) == head)
         end = next;
-      if (next > limit) break;
       pc = next;
     }
-    if (!end) return reject(stop, body);
+    if (!end) return reject("region size", body);
+    bool boundary[kMaxRegion] = {};
+    for (jsbytecode* pc = head; pc < end; pc += GetBytecodeLength(pc)) {
+      boundary[pc - head] = true;
+      if (JSOp(*pc) != JSOp::LoopHead) continue;
+      if (nloops == kMaxLoops) return reject("loop count", pc);
+      loops[nloops].head = pc;
+      loops[nloops++].ic = uint32_t(GET_INT32(pc));
+    }
     for (jsbytecode* pc = body; pc < end; pc += GetBytecodeLength(pc)) {
       JSOp op = JSOp(*pc);
+      if (!isJump(op)) continue;
+      jsbytecode* t = pc + GET_JUMP_OFFSET(pc);
+      if (t < head || t >= end) continue;
+      if (!boundary[t - head]) return reject("jump target", pc);
+      if (t > pc) continue;
+      int i = findLoop(t);
+      if (i < 0 || (op != JSOp::Goto && op != JSOp::JumpIfTrue && op != JSOp::JumpIfFalse))
+        return reject("backward jump", pc);
+      loops[i].end = pc + GetBytecodeLength(pc);
+    }
+    for (uint32_t i = 0; i < nloops; i++) {
+      Loop& l = loops[i];
+      if (!l.end) return reject("loop without backedge", l.head);
+      if (!i) continue;
+      uint32_t parent = 0;
+      for (uint32_t j = 0; j < i; j++) {
+        const Loop& p = loops[j];
+        if (l.head >= p.end) continue;
+        if (l.end >= p.end) return reject("crossing loops", l.head);
+        parent = j;
+      }
+      l.parent = parent;
+      l.depth = loops[parent].depth + 1;
+      if (l.depth > kMaxLoopNesting) return reject("loop nesting", l.head);
+    }
+    for (jsbytecode* pc = body; pc < end; pc += GetBytecodeLength(pc)) {
+      JSOp op = JSOp(*pc);
+      if (nloops > 1 && !nestedOp(op)) return reject("nested opcode", pc);
       switch (op) {
         case JSOp::GetArg:
         case JSOp::SetArg:
@@ -742,8 +881,17 @@ struct Compiler {
         default:
           if (isJump(op)) {
             jsbytecode* t = pc + GET_JUMP_OFFSET(pc);
-            if (t == head || t < head || t >= end) break;  // backedge / exit
-            if (t <= pc) return reject("backward jump", pc);
+            if (t < head || t >= end) break;
+            for (uint32_t i = 1; i < nloops; i++) {
+              const Loop& l = loops[i];
+              if (t > l.head && t < l.end && (pc < l.head || pc >= l.end))
+                return reject("loop side entry", pc);
+            }
+            if (t <= pc) {
+              int i = findLoop(t);
+              if (i < 0 || pc >= loops[i].end) return reject("backward jump", pc);
+              break;
+            }
             if (findTarget(t) >= 0) break;
             if (ntargets >= kMaxTargets) return reject("targets", pc);
             uint32_t i = ntargets++;
@@ -756,52 +904,45 @@ struct Compiler {
           break;
       }
     }
+    for (uint32_t j = 0; j < ntargets; j++) {
+      uint32_t owner = 0;
+      for (uint32_t i = 1; i < nloops; i++)
+        if (loops[i].head < targetPc[j] && targetPc[j] < loops[i].end) owner = i;
+      targetOwner[j] = owner;
+    }
     return true;
   }
 
-  // Pass 2: which variables are read before being written on some path from
-  // the head (the region is a DAG apart from the backedge).
+  // Pass 2: backwards fixed-point liveness over the complete CFG, including
+  // each inner/outer backedge. The bitvector equation is use | (out & ~def).
+  // External edges leave the region and need no Wasm-local input state.
   bool liveness() {
-    uint32_t defw = 0;
-    bool live = true;
-    uint32_t tdef[kMaxTargets];
-    bool tlive[kMaxTargets] = {};
-    uint32_t nextT = 0;
-    auto jumpTo = [&](jsbytecode* t) {
-      int j = findTarget(t);
-      if (j < 0) return;
-      tdef[j] = tlive[j] ? (tdef[j] & defw) : defw;
-      tlive[j] = true;
-    };
-    for (jsbytecode* pc = head + JSOpLength_LoopHead; pc < end;
-         pc += GetBytecodeLength(pc)) {
-      if (nextT < ntargets && targetPc[nextT] == pc) {
-        if (tlive[nextT]) defw = live ? (defw & tdef[nextT]) : tdef[nextT];
-        live = live || tlive[nextT];
-        nextT++;
-      }
-      if (!live) continue;
-      JSOp op = JSOp(*pc);
-      switch (op) {
-        case JSOp::GetLocal:
-        case JSOp::GetArg: {
-          int v = findVar(keyOf(pc));
-          if (!(defw & (1u << v))) varLive[v] = true;
-          break;
+    uint32_t in[kMaxRegion] = {};
+    jsbytecode* pcs[kMaxRegion];
+    uint32_t count = 0;
+    for (jsbytecode* pc = head; pc < end; pc += GetBytecodeLength(pc)) pcs[count++] = pc;
+    bool changed = true;
+    for (uint32_t pass = 0; changed; pass++) {
+      if (pass > count) return reject("liveness convergence", head);
+      changed = false;
+      for (uint32_t n = count; n > 0; n--) {
+        jsbytecode* pc = pcs[n - 1];
+        JSOp op = JSOp(*pc);
+        jsbytecode* next = pc + GetBytecodeLength(pc);
+        uint32_t live = op != JSOp::Goto && next < end ? in[next - head] : 0;
+        if (isJump(op)) {
+          jsbytecode* t = pc + GET_JUMP_OFFSET(pc);
+          if (t >= head && t < end) live |= in[t - head];
         }
-        case JSOp::SetLocal:
-        case JSOp::InitLexical:
-        case JSOp::SetArg:
-          defw |= 1u << findVar(keyOf(pc));
-          break;
-        default:
-          if (isJump(op)) {
-            jumpTo(pc + GET_JUMP_OFFSET(pc));
-            if (op == JSOp::Goto) live = false;
-          }
-          break;
+        if (op == JSOp::SetLocal || op == JSOp::InitLexical || op == JSOp::SetArg)
+          live &= ~(1u << findVar(keyOf(pc)));
+        if (op == JSOp::GetLocal || op == JSOp::GetArg)
+          live |= 1u << findVar(keyOf(pc));
+        if (in[pc - head] != live) { in[pc - head] = live; changed = true; }
       }
     }
+    for (uint32_t i = 0; i < nloops; i++) loops[i].liveMask = in[loops[i].head - head];
+    for (uint32_t v = 0; v < nvars; v++) varLive[v] = (in[0] >> v & 1) != 0;
     // Speculate each head-live variable keeps the type it has right now.
     for (uint32_t v = 0; v < nvars; v++) {
       headTy[v] = Ty::Head;
@@ -813,6 +954,8 @@ struct Compiler {
       } else {
         memcpy(&bits, frame - 8 * (size_t(key) + 1), 8);
       }
+      if (nloops > 1 && !IsNum(TyOfTag(uint32_t(bits >> 32))))
+        return reject("nested variable type", head);
       if (uint32_t(bits >> 32) == kTagObject) {
         // An Array the loop never replaces: its local holds the pointer.
         int kind = ArrayKind(bits);
@@ -1031,12 +1174,14 @@ struct Compiler {
 
   // A jump to `target`; with `cond` the i32 condition is on the wasm stack.
   bool branch(jsbytecode* pc, jsbytecode* target, jsbytecode* next, bool cond) {
-    uint32_t open = ntargets - firstOpen;
-    if (target == head) {
-      if (!checkBackedge(pc)) return false;
+    int loop = target <= pc ? findLoop(target) : -1;
+    if (loop >= 0) {
+      int nest = labelDepth(true, uint32_t(loop), cond ? 1 : 0);
+      if (nest < 0) return reject("loop label", pc);
+      if (!checkBackedge(pc, uint32_t(loop))) return false;
       if (cond) {
         code.put(W_IF), code.put(W_VOID);
-        emitBackedge(open + 1);
+        emitBackedge(uint32_t(loop), uint32_t(nest));
         code.put(W_END);
         if (next == end) {
           // Fallthrough of the final conditional backedge leaves the loop.
@@ -1044,7 +1189,7 @@ struct Compiler {
           st.live = false;
         }
       } else {
-        emitBackedge(open);
+        emitBackedge(uint32_t(loop), uint32_t(nest));
         st.live = false;
       }
       return true;
@@ -1053,7 +1198,9 @@ struct Compiler {
     if (j >= 0) {
       if (uint32_t(j) < firstOpen) return reject("backward jump", pc);
       if (!edge(uint32_t(j), pc)) return false;
-      code.put(cond ? W_BRIF : W_BR), code.uleb(uint32_t(j) - firstOpen);
+      int nest = labelDepth(false, uint32_t(j));
+      if (nest < 0) return reject("target label", pc);
+      code.put(cond ? W_BRIF : W_BR), code.uleb(uint32_t(nest));
       if (!cond) st.live = false;
       return true;
     }
@@ -1382,8 +1529,8 @@ struct Compiler {
     return true;
   }
 
-  // Pass 3: translate. Emits the entry guards, then the `loop` with one
-  // `block` per forward target.
+  // Pass 3: translate. Loop labels follow the natural-loop tree, and
+  // forward-target blocks open in the closest enclosing loop.
   bool translate() {
     for (uint32_t i = 0; i < kParams; i++) {
       lget(i), code.put(W_I32WRAP), lset(P_FRAME + i);
@@ -1440,21 +1587,28 @@ struct Compiler {
       lget(tmp64()), code.put(W_I32WRAP), lset(varLocal(v));
     }
     guardInsertion = code.n;
-    code.put(W_LOOP), code.put(W_VOID);
-    for (uint32_t j = 0; j < ntargets; j++) code.put(W_BLOCK), code.put(W_VOID);
+    if (!beginLoop(0, head)) return false;
 
     headIc = uint32_t(GET_INT32(head));
     icIndex = headIc;
     jsbytecode* pc = head + JSOpLength_LoopHead;
     while (pc < end) {
+      if (!closeLoops(pc)) return false;
       if (firstOpen < ntargets && targetPc[firstOpen] <= pc) {
         if (targetPc[firstOpen] != pc) return reject("jump target", pc);
         if (st.live && !edge(firstOpen, pc)) return false;  // fallthrough edge
+        if (!nlabels || labels[nlabels - 1].loop || labels[nlabels - 1].index != firstOpen)
+          return reject("target label", pc);
         code.put(W_END);
+        nlabels--;
         st = targetSt[firstOpen++];
       }
       JSOp op = JSOp(*pc);
       jsbytecode* next = pc + GetBytecodeLength(pc);
+      if (op == JSOp::LoopHead) {
+        int i = findLoop(pc);
+        if (i < 0 || !beginLoop(uint32_t(i), pc)) return false;
+      }
       if (!st.live) {  // unreachable from the head
         pc = next;
         continue;
@@ -1474,6 +1628,7 @@ struct Compiler {
           break;
         case JSOp::DebugLeaveLexicalEnv:  // no-op: OnLoopHead excludes debuggee frames
           break;
+        case JSOp::LoopHead:
         case JSOp::JumpTarget:
           icIndex = uint32_t(GET_INT32(pc));
           break;
@@ -1526,6 +1681,7 @@ struct Compiler {
           if (st.depth < 1) return reject("underflow", pc);
           uint32_t v = uint32_t(findVar(keyOf(pc)));
           Ty t = st.stack[top];
+          if (nloops > 1 && !IsNum(t)) return reject("nested variable type", pc);
           if (t == Ty::Int && (widen.vars >> v & 1)) {
             lget(slotLocal(top)), code.put(W_F64CONVI32S), lset(fl(varLocal(v)));
             t = Ty::Double;
@@ -1725,7 +1881,8 @@ struct Compiler {
     }
     if (firstOpen != ntargets) return reject("jump target", end);
     if (st.live) return reject("region end", end);
-    code.put(W_END);  // loop
+    if (!closeLoops(end)) return false;
+    if (nlabels || nactive) return reject("region labels", end);
     code.put(W_UNREACHABLE);
     return true;
   }
@@ -1798,7 +1955,10 @@ Compiler* TranslateLoop(Init init, Buf& m) {
       grown = grown || (c->want.slots[j] & ~w.slots[j]);
       w.slots[j] |= c->want.slots[j];
     }
-    if (!grown || attempt == 3) return c;
+    // Each retry adds a widening bit. Bound nested convergence as well as
+    // bytecode size; failure leaves interpretation in control.
+    uint32_t maxAttempts = c->nloops > 1 ? kMaxVars + kMaxLoops : 4;
+    if (!grown || uint32_t(attempt + 1) >= maxAttempts) return c;
     c->~Compiler();
     free(c);
   }
@@ -1821,15 +1981,27 @@ void LogReject(JSScript* script, const Compiler& c) {
           c.reason ? c.reason : "?");
 }
 
-void Evict(Entry* e) {
-  if (e->fn) {
-    syscall(SYS_jit_free, long(e->fn), 1L);
-  }
+void FreeNative(uint32_t fn, uint32_t slot, JSContext* cx,
+                const char* cause, bool gcEviction = false) {
+  long rc = syscall(SYS_jit_free, long(fn), 1L);
+  const int syscallErrno = errno;
+  cacheobs::Released(slot, fn, MajorGC(cx), cause, rc,
+                     rc == -1 ? syscallErrno : 0, gcEviction,
+                     [&](const cacheobs::Record& old) {
+    ObserveLocation(old.file, old.line, old.off, cx, "gc-evict", old.fn);
+  });
+  errno = syscallErrno;
+}
+
+void Evict(Entry* e, uint32_t slot, JSContext* cx, const char* cause,
+           bool gcEviction = false) {
+  if (e->fn) FreeNative(e->fn, slot, cx, cause, gcEviction);
   free(e->bytes);
   memset(e, 0, sizeof *e);
 }
 
-bool Install(JSScript* script, jsbytecode* pc, Entry* e, Compiler& c, Buf& m) {
+bool Install(JSScript* script, jsbytecode* pc, Entry* e, Compiler& c, Buf& m,
+             JSContext* cx, uint32_t slot) {
   if (c.reason) {
     LogReject(script, c);
     return false;
@@ -1843,10 +2015,15 @@ bool Install(JSScript* script, jsbytecode* pc, Entry* e, Compiler& c, Buf& m) {
     if (TakeLog()) fprintf(stderr, "PBLJIT install rc=%ld bytes=%zu\n", rc, m.n);
     return false;
   }
+  if (cacheobs::CaptureEnabled()) {
+    cacheobs::Installed(script->filename(), script->lineno(),
+                        unsigned(pc - script->code()), slot, idx[0], e->majorGC,
+                        uintptr_t(script), uintptr_t(pc));
+  }
   size_t len = size_t(c.end - pc);
   e->bytes = static_cast<uint8_t*>(malloc(len));
   if (!e->bytes) {
-    syscall(SYS_jit_free, long(idx[0]), 1L);
+    FreeNative(idx[0], slot, cx, "install-allocation-failure");
     return false;
   }
   memcpy(e->bytes, pc, len);
@@ -1863,7 +2040,7 @@ bool Install(JSScript* script, jsbytecode* pc, Entry* e, Compiler& c, Buf& m) {
             unsigned(pc - script->code()), len, c.nops, c.nvars, c.maxDepth,
             m.n, idx[0], c.attempts, static_cast<unsigned long long>(e->majorGC));
   }
-  if ((n & (n - 1)) == 0) {
+  if ((n & (n - 1)) == 0 && gLogEnabled.load(std::memory_order_relaxed)) {
     fprintf(stderr,
             "PBLJIT stats compiles=%u rejects=%u runs=%u bails=%u\n", n,
             gRejects.load(std::memory_order_relaxed),
@@ -1874,7 +2051,7 @@ bool Install(JSScript* script, jsbytecode* pc, Entry* e, Compiler& c, Buf& m) {
 }
 
 bool Compile(JSScript* script, jit::BaselineFrame* frame, jsbytecode* pc,
-             Entry* e, JSContext* cx) {
+             Entry* e, JSContext* cx, uint32_t slot) {
   if (gInstalls.load(std::memory_order_relaxed) >= kMaxInstalls) return false;
   Buf m;
   Compiler* cp = TranslateLoop(
@@ -1892,7 +2069,7 @@ bool Compile(JSScript* script, jit::BaselineFrame* frame, jsbytecode* pc,
       },
       m);
   if (!cp) return false;
-  bool ok = Install(script, pc, e, *cp, m);
+  bool ok = Install(script, pc, e, *cp, m, cx, slot);
   FreeCompiler(cp);
   return ok;
 }
@@ -1903,21 +2080,28 @@ typedef int64_t (*JitFn)(void* frame, void* sp, void* intr, void* out,
                          void* argv);
 
 // Diagnostic-only bounded observer. Owned source filter preserves budget.
-bool ObserverEnabled(JSScript* script) {
+bool ObserverActive() {
   static const bool enabled = [] {
     const char* v = getenv("PBLJIT_OBSERVE");
     return v && strcmp(v, "1") == 0;
   }();
-  if (!enabled) return false;
+  return enabled;
+}
+
+bool ObserverFilenameEnabled(const char* filename) {
+  if (!ObserverActive()) return false;
   static constexpr char prefix[] = "file:///home/admin/nightly-jit-safety/";
-  const char* filename = script->filename();
   return filename && strncmp(filename, prefix, sizeof(prefix) - 1) == 0;
 }
 
-void Observe(JSScript* script, jsbytecode* pc, JSContext* cx,
-             const char* event, uint32_t fn = 0, int64_t kind = -1,
-             uint32_t sp = 0, int32_t delta = 0, uint32_t ic = 0) {
-  if (!ObserverEnabled(script)) return;
+bool ObserverEnabled(JSScript* script) {
+  return ObserverActive() && ObserverFilenameEnabled(script->filename());
+}
+
+void ObserveLocation(const char* filename, unsigned line, unsigned off, JSContext* cx,
+                     const char* event, uint32_t fn, int64_t kind,
+                     uint32_t sp, int32_t delta, uint32_t ic) {
+  if (!ObserverFilenameEnabled(filename)) return;
   static std::atomic<int> remaining{4096};
   int observationRemaining = remaining.fetch_sub(1, std::memory_order_relaxed);
   if (observationRemaining <= 0) {
@@ -1926,11 +2110,18 @@ void Observe(JSScript* script, jsbytecode* pc, JSContext* cx,
     return;
   }
   PrintObservation("PBLJIT_OBS_EXHAUSTED reason=emission-failed\n", "PBLJIT_OBS event=%s file=%s line=%u off=%u tid=%ld pthread=%lu tls=%p epoch=%llu fn=%u kind=%lld sp=%u pcDelta=%d ic=%u\n",
-          event, script->filename() ? script->filename() : "?",
-          script->lineno(), unsigned(pc - script->code()),
+          event, filename, line, off,
           syscall(SYS_gettid), static_cast<unsigned long>((uintptr_t)pthread_self()), static_cast<void*>(&tCache),
           static_cast<unsigned long long>(MajorGC(cx)), fn,
           static_cast<long long>(kind), sp, delta, ic);
+}
+
+void Observe(JSScript* script, jsbytecode* pc, JSContext* cx,
+             const char* event, uint32_t fn = 0, int64_t kind = -1,
+             uint32_t sp = 0, int32_t delta = 0, uint32_t ic = 0) {
+  if (!ObserverEnabled(script)) return;
+  ObserveLocation(script->filename(), script->lineno(), unsigned(pc - script->code()),
+                  cx, event, fn, kind, sp, delta, ic);
 }
 
 void ObserveSkip(JSScript* script, jsbytecode* pc, JSContext* cx,
@@ -1998,8 +2189,9 @@ bool OnLoopHead(JSScript* script, jit::BaselineFrame* frame, uint64_t* sp,
               static_cast<unsigned long long>(e->majorGC),
               static_cast<unsigned long long>(gc));
     }
-    if (e->state == 1 && e->majorGC != gc) Observe(script, pc, cx, "gc-evict", e->fn);
-    Evict(e);
+    Evict(e, h, cx,
+          cacheobs::ReplacementCause(e->pc == pc && e->script == script, e->majorGC == gc),
+          e->state == 1 && e->majorGC != gc);
     e->pc = pc;
     e->script = script;
     e->majorGC = gc;
@@ -2008,14 +2200,14 @@ bool OnLoopHead(JSScript* script, jit::BaselineFrame* frame, uint64_t* sp,
   if (e->global != CurrentGlobal(cx)) return false;
   if (e->state != 1) {
     if (e->state == 2 || ++e->hits < kCompileHits) return false;
-    e->state = Compile(script, frame, pc, e, cx) ? 1 : 2;
+    e->state = Compile(script, frame, pc, e, cx, h) ? 1 : 2;
     if (e->state != 1) { ObserveSkip(script, pc, cx, "reject"); return false; }
     Observe(script, pc, cx, "install", e->fn);
   }
   // Same pc pointer, possibly a different (re-allocated) script: compare.
   if (MOZ_UNLIKELY(pc + e->len > script->codeEnd() ||
                    memcmp(pc, e->bytes, e->len) != 0)) {
-    Evict(e);
+    Evict(e, h, cx, "bytes");
     e->pc = pc;
     return false;
   }
@@ -2046,7 +2238,7 @@ bool OnLoopHead(JSScript* script, jit::BaselineFrame* frame, uint64_t* sp,
   if (kind == NoEntry || kind == Bail) {
     gBails.fetch_add(1, std::memory_order_relaxed);
     if (++e->bails >= kMaxBails) {
-      syscall(SYS_jit_free, long(e->fn), 1L);
+      FreeNative(e->fn, h, cx, "bail-limit");
       e->fn = 0;
       e->state = 2;
       if (TakeLog()) {

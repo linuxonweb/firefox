@@ -60,6 +60,12 @@
 #include "vm/TypeofEqOperand.h"  // TypeofEqOperand
 #include "vm/WrapperObject.h"
 
+#include <atomic>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include "debugger/DebugAPI-inl.h"
 #include "jit/BaselineFrame-inl.h"
 #include "jit/JitScript-inl.h"
@@ -71,6 +77,8 @@
 
 namespace js {
 namespace pbljit {
+void PrintObservation(const char* failure, const char* format, ...)
+    __attribute__((format(printf, 2, 3)));
 struct Exit { uint64_t* sp; int32_t pcDelta; uint32_t icIndex; };
 void ObserveSkip(JSScript* script, jsbytecode* pc, JSContext* cx,
                  const char* reason);
@@ -83,7 +91,67 @@ bool OnLoopHead(JSScript* script, jit::BaselineFrame* frame, uint64_t* sp,
 namespace js {
 namespace pbl {
 
+// Exact double -> int32. Out-of-range int32_t(d) is UB; for wasm clang folded
+// `double(int32_t(d)) != d` to a NaN test and trunc_sat saturated, so
+// Math.floor(2147483700.5) gave 2147483647. Range-check first.
+static inline bool PblExactInt32(double d, int32_t* out) {
+  if (!(d >= -2147483648.0 && d <= 2147483647.0)) {
+    return false;
+  }
+  *out = int32_t(d);
+  return double(*out) == d;
+}
+
 using namespace js::jit;
+
+// PBL adapter diagnostics: CacheOps that PBL does not implement make their
+// stub fail on every use. Count them and print the most frequent now and
+// then (PBLUNIMPL=0 silences it).
+static const char* const kPblCacheOpNames[] = {
+#define OP(name, ...) #name,
+    CACHE_IR_OPS(OP)
+#undef OP
+};
+static std::atomic<uint32_t> gPblUnimpl[uint32_t(CacheOp::NumOpcodes)];
+static std::atomic<uint32_t> gPblUnimplTotal;
+static std::atomic<int> gPblUnimplLines{-1};
+static void PblUnimplHit(uint32_t op) {
+  gPblUnimpl[op].fetch_add(1, std::memory_order_relaxed);
+  uint32_t t = gPblUnimplTotal.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (t != 1 && (t & 0x3fff) != 0) {
+    return;
+  }
+  int lines = gPblUnimplLines.load(std::memory_order_relaxed);
+  if (lines < 0) {
+    const char* e = getenv("PBLUNIMPL");
+    lines = (e && e[0] == '0') ? 0 : 16;
+  }
+  if (lines == 0) {
+    gPblUnimplLines.store(0, std::memory_order_relaxed);
+    return;
+  }
+  gPblUnimplLines.store(lines - 1, std::memory_order_relaxed);
+  char buf[512];
+  int n = snprintf(buf, sizeof(buf), "PBLUNIMPL total=%u", t);
+  uint32_t shown[6] = {};
+  for (int k = 0; k < 6 && n > 0 && size_t(n) < sizeof(buf); k++) {
+    uint32_t best = UINT32_MAX, bestCount = 0;
+    for (uint32_t i = 0; i < uint32_t(CacheOp::NumOpcodes); i++) {
+      uint32_t c = gPblUnimpl[i].load(std::memory_order_relaxed);
+      bool seen = false;
+      for (int j = 0; j < k; j++) seen |= shown[j] == i;
+      if (!seen && c > bestCount) {
+        best = i;
+        bestCount = c;
+      }
+    }
+    if (best == UINT32_MAX) break;
+    shown[k] = best;
+    n += snprintf(buf + n, sizeof(buf) - n, " %s=%u", kPblCacheOpNames[best],
+                  bestCount);
+  }
+  fprintf(stderr, "%s\n", buf);
+}
 
 /*
  * Debugging: enable `TRACE_INTERP` for an extremely detailed dump of
@@ -490,6 +558,14 @@ struct ICCtx {
   StackVal* sp_;
   PBIResult error;
   uint64_t arg2;
+  // PblIc single-op stepping (see PblIc.inc): when stepEnd != 0,
+  // ICInterpretOps runs only the CacheIR bytes [stepOff, stepEnd) with
+  // retValue = stepRet, and sets stepDone to 1 on success, 0 when it
+  // continued with the next stub.
+  uint32_t stepOff = 0;
+  uint32_t stepEnd = 0;
+  uint32_t stepDone = 0;
+  uint64_t stepRet = 0;
 
   ICCtx(JSContext* cx, BaselineFrame* frame_, State& state_, Stack& stack_)
       : frame(frame_),
@@ -545,9 +621,14 @@ static double DoubleMinMax(bool isMax, double first, double second) {
   }
 }
 
+namespace pblic {
+void CountStep(const uint8_t* at);
+}
+
 // Interpreter for CacheIR.
 uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
                         ICCtx& ctx) {
+  const bool stepping = ctx.stepEnd != 0;
   {
 #define DECLARE_CACHEOP_CASE(name) __label__ cacheop_##name
 
@@ -829,6 +910,10 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
     DECLARE_CACHEOP_CASE(LoadStringAtResult);
     DECLARE_CACHEOP_CASE(LoadStringCodePointResult);
     DECLARE_CACHEOP_CASE(CallNativeGetterResult);
+    DECLARE_CACHEOP_CASE(CallDOMFunction);
+    DECLARE_CACHEOP_CASE(CallDOMFunctionWithAllocSite);
+    DECLARE_CACHEOP_CASE(CallDOMGetterResult);
+    DECLARE_CACHEOP_CASE(CallDOMSetter);
     DECLARE_CACHEOP_CASE(LoadUndefinedResult);
     DECLARE_CACHEOP_CASE(LoadDoubleConstant);
     DECLARE_CACHEOP_CASE(LoadBooleanConstant);
@@ -884,7 +969,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
 
 #define PREDICT_NEXT(name)                            \
   static_assert(CacheOp::name != CacheOp::PblReturn); \
-  if (cacheIRReader.peekOp() == CacheOp::name) {      \
+  if (cacheIRReader.more() &&                         \
+      cacheIRReader.peekOp() == CacheOp::name) {      \
     cacheIRReader.readOp();                           \
     cacheop = CacheOp::name;                          \
     goto cacheop_##name;                              \
@@ -893,18 +979,29 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
 #define PREDICT_RETURN()                                 \
   if (!cacheIRReader.more()) {                           \
     TRACE_PRINTF("stub successful, predicted return\n"); \
+    if (stepping) ctx.stepDone = 1;                      \
     return retValue;                                     \
   }
 
     ICCacheIRStub* cstub = stub->toCacheIRStub();
     const CacheIRStubInfo* stubInfo = cstub->stubInfo();
-    CacheIRReader cacheIRReader(stubInfo);
+    const uint8_t* stepCode = stubInfo->code();
+    CacheIRReader cacheIRReader(
+        stepCode + (stepping ? ctx.stepOff : 0),
+        stepCode + (stepping ? ctx.stepEnd : stubInfo->codeLength()));
     uint64_t retValue = 0;
     CacheOp cacheop;
 
-    WRITE_VALUE_REG(0, Value::fromRawBits(arg0));
-    WRITE_VALUE_REG(1, Value::fromRawBits(arg1));
-    WRITE_VALUE_REG(2, Value::fromRawBits(ctx.arg2));
+    if (stepping) {
+      retValue = ctx.stepRet;
+      ctx.stepEnd = 0;
+      ctx.stepDone = 0;
+      pblic::CountStep(stepCode + ctx.stepOff);
+    } else {
+      WRITE_VALUE_REG(0, Value::fromRawBits(arg0));
+      WRITE_VALUE_REG(1, Value::fromRawBits(arg1));
+      WRITE_VALUE_REG(2, Value::fromRawBits(ctx.arg2));
+    }
 
     DISPATCH_CACHEOP();
 
@@ -916,6 +1013,7 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
 
       CACHEOP_CASE(PblReturn) {
         TRACE_PRINTF("stub successful!\n");
+        if (stepping) ctx.stepDone = 1;
         return retValue;
       }
 
@@ -1071,8 +1169,9 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
           DISPATCH_CACHEOP();
         } else if (val.isDouble()) {
           double doubleVal = val.toDouble();
-          if (int32_t(doubleVal) == doubleVal) {
-            WRITE_REG(resultId.id(), int32_t(doubleVal), INT32);
+          int32_t intVal;
+          if (PblExactInt32(doubleVal, &intVal)) {
+            WRITE_REG(resultId.id(), intVal, INT32);
             DISPATCH_CACHEOP();
           }
         }
@@ -2258,16 +2357,31 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
       }
 
       CACHEOP_CASE(CallScriptedFunction)
-      CACHEOP_CASE_FALLTHROUGH(CallNativeFunction) {
-        bool isNative = cacheop == CacheOp::CallNativeFunction;
+      CACHEOP_CASE_FALLTHROUGH(CallNativeFunction)
+      CACHEOP_CASE_FALLTHROUGH(CallDOMFunction)
+      CACHEOP_CASE_FALLTHROUGH(CallDOMFunctionWithAllocSite) {
+        // DOM methods (PBL adapter): CacheIR attaches these for DOM `this`
+        // objects; the stub's guards already checked the |this| shape and
+        // the callee, so calling the method's JSNative (which unwraps
+        // |this| itself) is the same call CallNativeFunction makes.
+        bool isDOM = cacheop == CacheOp::CallDOMFunction ||
+                     cacheop == CacheOp::CallDOMFunctionWithAllocSite;
+        bool isNative = cacheop == CacheOp::CallNativeFunction || isDOM;
         TRACE_PRINTF("CallScriptedFunction / CallNativeFunction (native: %d)\n",
                      isNative);
         ObjOperandId calleeId = cacheIRReader.objOperandId();
         Int32OperandId argcId = cacheIRReader.int32OperandId();
+        if (isDOM) {
+          (void)cacheIRReader.objOperandId();  // thisObj
+        }
         CallFlags flags = cacheIRReader.callFlags();
         uint32_t argcFixed = cacheIRReader.uint32Immediate();
         bool ignoresRv = false;
-        if (isNative) {
+        if (isDOM) {
+          if (cacheop == CacheOp::CallDOMFunctionWithAllocSite) {
+            (void)cacheIRReader.stubOffset();  // site
+          }
+        } else if (isNative) {
           ignoresRv = cacheIRReader.readBool();
         }
 
@@ -3818,8 +3932,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
           FAIL_IC();
         }
         double result = std::floor(input);
-        int32_t intResult = int32_t(result);
-        if (double(intResult) != result) {
+        int32_t intResult;
+        if (!PblExactInt32(result, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
@@ -3834,8 +3948,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
           FAIL_IC();
         }
         double result = std::ceil(input);
-        int32_t intResult = int32_t(result);
-        if (double(intResult) != result) {
+        int32_t intResult;
+        if (!PblExactInt32(result, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
@@ -3846,12 +3960,12 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
       CACHEOP_CASE(MathTruncToInt32Result) {
         NumberOperandId inputId = cacheIRReader.numberOperandId();
         double input = READ_VALUE_REG(inputId.id()).toNumber();
-        if (input == 0.0 && std::signbit(input)) {
+        if (input > -1.0 && std::signbit(input)) {
           FAIL_IC();
         }
         double result = std::trunc(input);
-        int32_t intResult = int32_t(result);
-        if (double(intResult) != result) {
+        int32_t intResult;
+        if (!PblExactInt32(result, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
@@ -3865,8 +3979,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
         if (input == 0.0 && std::signbit(input)) {
           FAIL_IC();
         }
-        int32_t intResult = int32_t(input);
-        if (double(intResult) != input) {
+        int32_t intResult;
+        if (!PblExactInt32(input, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
@@ -3978,8 +4092,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
         if (std::isnan(input)) {
           FAIL_IC();
         }
-        int32_t result = int32_t(input);
-        if (double(result) != input) {
+        int32_t result;
+        if (!PblExactInt32(input, &result)) {
           FAIL_IC();
         }
         retValue = Int32Value(result).asRawBits();
@@ -4407,6 +4521,50 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
             return IC_ERROR_SENTINEL();
           }
           retValue = resultRooted.asRawBits();
+        }
+        PREDICT_RETURN();
+        DISPATCH_CACHEOP();
+      }
+
+      CACHEOP_CASE(CallDOMGetterResult) {
+        // PBL adapter: the DOM getter through the same VM helper Baseline
+        // calls (jit::CallDOMGetter); guards precede this op in the stub.
+        ObjOperandId objId = cacheIRReader.objOperandId();
+        uint32_t jitInfoOffset = cacheIRReader.stubOffset();
+        JSObject* obj = reinterpret_cast<JSObject*>(READ_REG(objId.id()));
+        const JSJitInfo* info = reinterpret_cast<const JSJitInfo*>(
+            stubInfo->getStubRawWord(cstub, jitInfoOffset));
+        {
+          PUSH_IC_FRAME();
+          ReservedRooted<JSObject*> objRooted(&ctx.state.obj0, obj);
+          ReservedRooted<Value> resultRooted(&ctx.state.value1);
+          if (!CallDOMGetter(cx, info, objRooted, &resultRooted)) {
+            ctx.error = PBIResult::Error;
+            return IC_ERROR_SENTINEL();
+          }
+          retValue = resultRooted.asRawBits();
+        }
+        PREDICT_RETURN();
+        DISPATCH_CACHEOP();
+      }
+
+      CACHEOP_CASE(CallDOMSetter) {
+        // PBL adapter: jit::CallDOMSetter, as Baseline does.
+        ObjOperandId objId = cacheIRReader.objOperandId();
+        uint32_t jitInfoOffset = cacheIRReader.stubOffset();
+        ValOperandId rhsId = cacheIRReader.valOperandId();
+        JSObject* obj = reinterpret_cast<JSObject*>(READ_REG(objId.id()));
+        Value rhs = READ_VALUE_REG(rhsId.id());
+        const JSJitInfo* info = reinterpret_cast<const JSJitInfo*>(
+            stubInfo->getStubRawWord(cstub, jitInfoOffset));
+        {
+          PUSH_IC_FRAME();
+          ReservedRooted<JSObject*> objRooted(&ctx.state.obj0, obj);
+          ReservedRooted<Value> rhsRooted(&ctx.state.value1, rhs);
+          if (!CallDOMSetter(cx, info, objRooted, rhsRooted)) {
+            ctx.error = PBIResult::Error;
+            return IC_ERROR_SENTINEL();
+          }
         }
         PREDICT_RETURN();
         DISPATCH_CACHEOP();
@@ -5410,13 +5568,18 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
 #define CACHEOP_UNIMPL(name, ...)               \
   cacheop_##name : __attribute__((unused));     \
   TRACE_PRINTF("unknown CacheOp: " #name "\n"); \
+  PblUnimplHit(uint32_t(CacheOp::name));        \
   FAIL_IC();
   CACHE_IR_OPS(CACHEOP_UNIMPL)
 #undef CACHEOP_UNIMPL
 
 next_ic:
   TRACE_PRINTF("IC failed; next IC\n");
-  return CallNextIC(arg0, arg1, stub, ctx);
+  {
+    uint64_t result = CallNextIC(arg0, arg1, stub, ctx);
+    if (stepping) ctx.stepDone = 0;
+    return result;
+  }
 }
 
 static MOZ_NEVER_INLINE uint64_t CallNextIC(uint64_t arg0, uint64_t arg1,
@@ -5768,8 +5931,12 @@ uint8_t* GetPortableFallbackStub(BaselineICFallbackKind kind) {
   }
 }
 
+#include "PblTierObserve.h"
+#include "PblIc.inc"
+#include "PblMethod.inc"
+
 uint8_t* GetICInterpreter() {
-  return reinterpret_cast<uint8_t*>(&ICInterpretOps);
+  return reinterpret_cast<uint8_t*>(&PblIcEntry);
 }
 
 /*
@@ -5810,8 +5977,9 @@ static EnvironmentObject& getEnvironmentFromCoordinate(
 #define LABEL(op) (&&label_##op)
 #ifdef ENABLE_COMPUTED_GOTO_DISPATCH
 #  define CASE(op) label_##op:
-#  define DISPATCH() \
-    DEBUG_CHECK();   \
+#  define DISPATCH()                         \
+    DEBUG_CHECK();                           \
+    if (MOZ_UNLIKELY(bcPending)) goto bc_hook; \
     goto* addresses[*pc]
 #else
 #  define CASE(op) label_##op : case JSOp::op:
@@ -5935,7 +6103,8 @@ PBIResult PortableBaselineInterpret(
   icEntries = frame->icScript()->icEntries();                       \
   icEntry = frame->interpreterICEntry();                            \
   argsObjAliasesFormals = frame->script()->argsObjAliasesFormals(); \
-  resumeOffsets = isd->resumeOffsets().data();
+  resumeOffsets = isd->resumeOffsets().data();                      \
+  bcPending = bcOn;
 
 #define OPCODE_LABEL(op, ...) LABEL(op),
 #define TRAILING_LABEL(v) LABEL(default),
@@ -5974,6 +6143,9 @@ PBIResult PortableBaselineInterpret(
   auto* icEntries = frame->icScript()->icEntries();
   auto* icEntry = icEntries;
   const uint32_t* resumeOffsets = isd->resumeOffsets().data();
+  // PblMethod hook: pending at entry, calls, returns, catches and loop heads.
+  const bool bcOn = pblbc::Enabled();
+  bool bcPending = bcOn;
 
   if (IsRestart) {
     ic_result = restartCode;
@@ -8240,6 +8412,7 @@ PBIResult PortableBaselineInterpret(
       CASE(LoopHead) {
         int32_t icIndex = GET_INT32(pc);
         icEntry = icEntries + icIndex;
+        bcPending = bcOn;
 #ifdef ENABLE_INTERRUPT_CHECKS
         if (ctx.frameMgr.cxForLocalUseOnly()->hasAnyPendingInterrupt()) {
           PUSH_EXIT_FRAME();
@@ -9160,6 +9333,29 @@ error:
 
   DISPATCH();
 
+bc_hook: {
+  bcPending = false;
+  if (!frame->isDebuggee()) {
+    pblbc::Out bo;
+    int r = pblbc::Hook(frame, sp, pc, entryPC, isd, icEntries, icEntry,
+                        argsObjAliasesFormals, ctx, &bo);
+    if (r == pblbc::kPending) {
+      bcPending = true;
+    } else if (r >= pblbc::kRan) {
+      sp = bo.sp;
+      pc = bo.pc;
+      icEntry = bo.icEntry;
+      bcPending = true;
+      if (r == pblbc::kRanIcError) {
+        ic_result = ctx.error;
+        goto ic_fail;
+      }
+    }
+  }
+  DEBUG_CHECK();
+  goto* addresses[*pc];
+}
+
 ic_fail:
   RESTART(ic_result);
   switch (ic_result) {
@@ -9348,6 +9544,20 @@ MethodStatus CanEnterPortableBaselineInterpreter(JSContext* cx,
   if (!JitOptions.portableBaselineInterpreter) {
     return MethodStatus::Method_CantCompile;
   }
+  const bool debuggee = state.script()->isDebuggee();
+  const bool coverage = state.script()->hasScriptCounts() ||
+                        cx->realm()->collectCoverageForDebug();
+  if (debuggee || coverage) {
+    if (debuggee) {
+      js::pbljit::ObserveSkip(state.script(), state.script()->code(), cx,
+                            "skip-debuggee");
+    }
+    if (coverage) {
+      js::pbljit::ObserveSkip(state.script(), state.script()->code(), cx,
+                            "skip-coverage");
+    }
+    return MethodStatus::Method_CantCompile;
+  }
   if (state.script()->hasJitScript()) {
     return MethodStatus::Method_Compiled;
   }
@@ -9368,18 +9578,27 @@ MethodStatus CanEnterPortableBaselineInterpreter(JSContext* cx,
       return MethodStatus::Method_CantCompile;
     }
   }
+  // The C++ interpreter cannot OSR into the portable tier at a loop head.
+  // Admit loop scripts here so a long first invocation can reach the native
+  // loop hotness checks. Straight-line scripts keep invocation warmup.
   if (state.script()->getWarmUpCount() <=
-      JitOptions.portableBaselineInterpreterWarmUpThreshold) {
+          JitOptions.portableBaselineInterpreterWarmUpThreshold &&
+      !state.script()->hasLoops()) {
     return MethodStatus::Method_Skipped;
   }
-  // After warmup and before first JitScript allocation: retain C++ exception policy.
+  // Before first JitScript allocation, retain the C++ exception policy for both
+  // warmed scripts and first-invocation loops.
   bool reject = false;
   for (const auto& note : state.script()->trynotes()) {
     reject |= note.kind() == TryNoteKind::Catch ||
               note.kind() == TryNoteKind::Finally;
   }
+  // Throw ops alone no longer keep a script in the C++ interpreter: hot
+  // functions with cold error paths (WebGL helper libraries) ran there
+  // forever. PBLIC=0 restores the old rule for A/B comparisons.
   for (jsbytecode* pc = state.script()->code();
-       !reject && pc < state.script()->codeEnd(); pc += GetBytecodeLength(pc)) {
+       !reject && !pblic::Enabled() && pc < state.script()->codeEnd();
+       pc += GetBytecodeLength(pc)) {
     JSOp op = JSOp(*pc);
     reject = op == JSOp::Throw || op == JSOp::ThrowWithStack;
   }
