@@ -60,6 +60,12 @@
 #include "vm/TypeofEqOperand.h"  // TypeofEqOperand
 #include "vm/WrapperObject.h"
 
+#include <atomic>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include "debugger/DebugAPI-inl.h"
 #include "jit/BaselineFrame-inl.h"
 #include "jit/JitScript-inl.h"
@@ -71,6 +77,8 @@
 
 namespace js {
 namespace pbljit {
+void PrintObservation(const char* failure, const char* format, ...)
+    __attribute__((format(printf, 2, 3)));
 struct Exit { uint64_t* sp; int32_t pcDelta; uint32_t icIndex; };
 void ObserveSkip(JSScript* script, jsbytecode* pc, JSContext* cx,
                  const char* reason);
@@ -83,7 +91,77 @@ bool OnLoopHead(JSScript* script, jit::BaselineFrame* frame, uint64_t* sp,
 namespace js {
 namespace pbl {
 
+// Exact double -> int32. Out-of-range int32_t(d) is UB; for wasm clang folded
+// `double(int32_t(d)) != d` to a NaN test and trunc_sat saturated, so
+// Math.floor(2147483700.5) gave 2147483647. Range-check first.
+static inline bool PblExactInt32(double d, int32_t* out) {
+  if (!(d >= -2147483648.0 && d <= 2147483647.0)) {
+    return false;
+  }
+  *out = int32_t(d);
+  return double(*out) == d;
+}
+
 using namespace js::jit;
+
+// PBL adapter diagnostics: CacheOps that PBL does not implement make their
+// stub fail on every use. Count them and print the most frequent now and
+// then (PBLUNIMPL=0 silences it).
+static const char* const kPblCacheOpNames[] = {
+#define OP(name, ...) #name,
+    CACHE_IR_OPS(OP)
+#undef OP
+};
+static std::atomic<uint32_t> gPblUnimpl[uint32_t(CacheOp::NumOpcodes)];
+static std::atomic<uint32_t> gPblUnimplTotal;
+static std::atomic<int> gPblUnimplLines{-1};
+static void PblUnimplHit(uint32_t op) {
+  gPblUnimpl[op].fetch_add(1, std::memory_order_relaxed);
+  uint32_t t = gPblUnimplTotal.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (t != 1 && (t & 0x3fff) != 0) {
+    return;
+  }
+  int lines = gPblUnimplLines.load(std::memory_order_relaxed);
+  if (lines < 0) {
+    const char* e = getenv("PBLUNIMPL");
+    lines = (e && e[0] == '0') ? 0 : 16;
+  }
+  if (lines == 0) {
+    gPblUnimplLines.store(0, std::memory_order_relaxed);
+    return;
+  }
+  gPblUnimplLines.store(lines - 1, std::memory_order_relaxed);
+  char buf[512];
+  int n = snprintf(buf, sizeof(buf), "PBLUNIMPL total=%u", t);
+  uint32_t shown[6] = {};
+  for (int k = 0; k < 6 && n > 0 && size_t(n) < sizeof(buf); k++) {
+    uint32_t best = UINT32_MAX, bestCount = 0;
+    for (uint32_t i = 0; i < uint32_t(CacheOp::NumOpcodes); i++) {
+      uint32_t c = gPblUnimpl[i].load(std::memory_order_relaxed);
+      bool seen = false;
+      for (int j = 0; j < k; j++) seen |= shown[j] == i;
+      if (!seen && c > bestCount) {
+        best = i;
+        bestCount = c;
+      }
+    }
+    if (best == UINT32_MAX) break;
+    shown[k] = best;
+    n += snprintf(buf + n, sizeof(buf) - n, " %s=%u", kPblCacheOpNames[best],
+                  bestCount);
+  }
+  fprintf(stderr, "%s\n", buf);
+}
+
+// PBL_FOROF_IC=0 leaves StoreFixedSlotUndefinedResult (UnsafeSetReservedSlot,
+// e.g. in self-hosted ArrayIteratorNext) unimplemented, as before; default on.
+static bool PblForOfIcOn() {
+  static const bool on = [] {
+    const char* e = getenv("PBL_FOROF_IC");
+    return !(e && e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
 
 /*
  * Debugging: enable `TRACE_INTERP` for an extremely detailed dump of
@@ -137,6 +215,31 @@ static const bool kHybridICsInterp = PBL_HYBRID_ICS_DEFAULT;
 
 // Large enough for an exit frame.
 static const size_t kStackMargin = 1024;
+
+// Reserve at the end of the portable-baseline stack that JS->JS frame pushes
+// inside a run (Stack::checkJS) must leave free. Native->JS entries
+// (PortablebaselineInterpreterStackCheck, a non-restart run's own entry check
+// and the IC stubs that start one) keep the small kStackMargin and may use
+// it: they are limited to PBL_NESTMAX by tPblNest, so the reserve keeps
+// EnterJit from failing (NotEntered -> C++ js::Interpret, whose nested
+// native->JS levels nothing counts and which overflow the host wasm stack).
+// Sized for PBL_NESTMAX (80) nested entries of typical frames (c84 notes).
+// PBL_STACKRESERVE=N bytes overrides, read once.
+static constexpr size_t kPblStackReserveDefault = 64 * 1024;
+static size_t PblStackReserve() {
+  static const size_t reserve = [] {
+    const char* e = getenv("PBL_STACKRESERVE");
+    if (e && e[0] >= '0' && e[0] <= '9') {
+      char* end = nullptr;
+      unsigned long v = strtoul(e, &end, 10);
+      if (end && *end == '\0') {
+        return v > (64ul << 20) ? size_t(64ul << 20) : size_t(v);
+      }
+    }
+    return kPblStackReserveDefault;
+  }();
+  return reserve;
+}
 
 /*
  * A 64-bit value on the auxiliary stack. May either be a raw uint64_t
@@ -212,6 +315,13 @@ struct Stack {
   MOZ_ALWAYS_INLINE bool check(StackVal* sp, size_t size, bool margin = true) {
     return reinterpret_cast<uintptr_t>(base) + size +
                (margin ? kStackMargin : 0) <=
+           reinterpret_cast<uintptr_t>(sp);
+  }
+
+  // JS->JS frame pushes within a run: also leave PblStackReserve() free.
+  MOZ_ALWAYS_INLINE bool checkJS(StackVal* sp, size_t size) {
+    return reinterpret_cast<uintptr_t>(base) + size + kStackMargin +
+               PblStackReserve() <=
            reinterpret_cast<uintptr_t>(sp);
   }
 
@@ -349,43 +459,66 @@ struct ICRegs {
   int extraArgs;
 };
 
+// Scratch roots for one PortableBaselineTrampoline activation. One
+// RootedTuple is a single stack-root list entry (push/pop) instead of one
+// per field; each RootedField is a drop-in replacement for the Rooted it
+// replaces (same Handle/MutableHandle conversions, same tracing).
 struct State {
-  RootedValue value0;
-  RootedValue value1;
-  RootedValue value2;
-  RootedValue value3;
-  RootedValue res;
-  RootedObject obj0;
-  RootedObject obj1;
-  RootedObject obj2;
-  RootedString str0;
-  RootedString str1;
-  RootedString str2;
-  RootedScript script0;
-  Rooted<PropertyName*> name0;
-  Rooted<jsid> id0;
-  Rooted<JSAtom*> atom0;
-  RootedFunction fun0;
-  Rooted<Scope*> scope0;
+  JS::RootedTuple<Value,
+                  Value,
+                  Value,
+                  Value,
+                  Value,
+                  JSObject*,
+                  JSObject*,
+                  JSObject*,
+                  JSString*,
+                  JSString*,
+                  JSString*,
+                  JSScript*,
+                  PropertyName*,
+                  jsid,
+                  JSAtom*,
+                  JSFunction*,
+                  Scope*>
+      roots;
+  JS::RootedField<Value, 0> value0;
+  JS::RootedField<Value, 1> value1;
+  JS::RootedField<Value, 2> value2;
+  JS::RootedField<Value, 3> value3;
+  JS::RootedField<Value, 4> res;
+  JS::RootedField<JSObject*, 5> obj0;
+  JS::RootedField<JSObject*, 6> obj1;
+  JS::RootedField<JSObject*, 7> obj2;
+  JS::RootedField<JSString*, 8> str0;
+  JS::RootedField<JSString*, 9> str1;
+  JS::RootedField<JSString*, 10> str2;
+  JS::RootedField<JSScript*, 11> script0;
+  JS::RootedField<PropertyName*, 12> name0;
+  JS::RootedField<jsid, 13> id0;
+  JS::RootedField<JSAtom*, 14> atom0;
+  JS::RootedField<JSFunction*, 15> fun0;
+  JS::RootedField<Scope*, 16> scope0;
 
   explicit State(JSContext* cx)
-      : value0(cx),
-        value1(cx),
-        value2(cx),
-        value3(cx),
-        res(cx),
-        obj0(cx),
-        obj1(cx),
-        obj2(cx),
-        str0(cx),
-        str1(cx),
-        str2(cx),
-        script0(cx),
-        name0(cx),
-        id0(cx),
-        atom0(cx),
-        fun0(cx),
-        scope0(cx) {}
+      : roots(cx),
+        value0(roots),
+        value1(roots),
+        value2(roots),
+        value3(roots),
+        res(roots),
+        obj0(roots),
+        obj1(roots),
+        obj2(roots),
+        str0(roots),
+        str1(roots),
+        str2(roots),
+        script0(roots),
+        name0(roots),
+        id0(roots),
+        atom0(roots),
+        fun0(roots),
+        scope0(roots) {}
 };
 
 /*
@@ -490,6 +623,22 @@ struct ICCtx {
   StackVal* sp_;
   PBIResult error;
   uint64_t arg2;
+  // PblIc single-op stepping (see PblIc.inc): when stepEnd != 0,
+  // ICInterpretOps runs only the CacheIR bytes [stepOff, stepEnd) with
+  // retValue = stepRet, and sets stepDone to 1 on success, 0 when it
+  // continued with the next stub.
+  uint32_t stepOff = 0;
+  uint32_t stepEnd = 0;
+  uint32_t stepDone = 0;
+  uint64_t stepRet = 0; uint64_t pblEpochHi = 0;  // PblMethod.inc GcEpochHit
+  // PBLBC_GETTER (PblMethod.inc CallGetter): set to 1 by compiled GetProp
+  // code around its IC call only. A non-stepping CallScriptedGetterResult
+  // that ends its stub then clears it, stores the getter, receiver and stub
+  // here and returns PBL_GETTER_SENTINEL() instead of the nested run.
+  uint32_t getterReq = 0;
+  uint64_t getterRecv = 0;
+  void* getterFn = nullptr;
+  void* getterStub = nullptr;
 
   ICCtx(JSContext* cx, BaselineFrame* frame_, State& state_, Stack& stack_)
       : frame(frame_),
@@ -505,6 +654,8 @@ struct ICCtx {
 };
 
 #define IC_ERROR_SENTINEL() (JS::MagicValue(JS_GENERIC_MAGIC).asRawBits())
+// Never a GetProp result (a magic value with a private uint32 payload).
+#define PBL_GETTER_SENTINEL() (JS::MagicValueUint32(0x9e77e5u).asRawBits())
 
 // Universal signature for an IC stub function.
 typedef uint64_t (*ICStubFunc)(uint64_t arg0, uint64_t arg1, ICStub* stub,
@@ -545,9 +696,17 @@ static double DoubleMinMax(bool isMax, double first, double second) {
   }
 }
 
+namespace pblic {
+void CountStep(const uint8_t* at);
+extern bool gDynStat;
+void CountInterp(ICCacheIRStub* stub);
+}
+
 // Interpreter for CacheIR.
 uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
                         ICCtx& ctx) {
+  const bool stepping = ctx.stepEnd != 0;
+  const uint32_t stepEndIn = ctx.stepEnd;  // PBLBC_GETTER (PblIc last step)
   {
 #define DECLARE_CACHEOP_CASE(name) __label__ cacheop_##name
 
@@ -668,6 +827,7 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
     DECLARE_CACHEOP_CASE(MegamorphicSetElement);
     DECLARE_CACHEOP_CASE(StoreFixedSlot);
     DECLARE_CACHEOP_CASE(StoreDynamicSlot);
+    DECLARE_CACHEOP_CASE(StoreFixedSlotUndefinedResult);
     DECLARE_CACHEOP_CASE(AddAndStoreFixedSlot);
     DECLARE_CACHEOP_CASE(AddAndStoreDynamicSlot);
     DECLARE_CACHEOP_CASE(AllocateAndStoreDynamicSlot);
@@ -829,6 +989,10 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
     DECLARE_CACHEOP_CASE(LoadStringAtResult);
     DECLARE_CACHEOP_CASE(LoadStringCodePointResult);
     DECLARE_CACHEOP_CASE(CallNativeGetterResult);
+    DECLARE_CACHEOP_CASE(CallDOMFunction);
+    DECLARE_CACHEOP_CASE(CallDOMFunctionWithAllocSite);
+    DECLARE_CACHEOP_CASE(CallDOMGetterResult);
+    DECLARE_CACHEOP_CASE(CallDOMSetter);
     DECLARE_CACHEOP_CASE(LoadUndefinedResult);
     DECLARE_CACHEOP_CASE(LoadDoubleConstant);
     DECLARE_CACHEOP_CASE(LoadBooleanConstant);
@@ -884,7 +1048,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
 
 #define PREDICT_NEXT(name)                            \
   static_assert(CacheOp::name != CacheOp::PblReturn); \
-  if (cacheIRReader.peekOp() == CacheOp::name) {      \
+  if (cacheIRReader.more() &&                         \
+      cacheIRReader.peekOp() == CacheOp::name) {      \
     cacheIRReader.readOp();                           \
     cacheop = CacheOp::name;                          \
     goto cacheop_##name;                              \
@@ -893,18 +1058,30 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
 #define PREDICT_RETURN()                                 \
   if (!cacheIRReader.more()) {                           \
     TRACE_PRINTF("stub successful, predicted return\n"); \
+    if (stepping) ctx.stepDone = 1;                      \
     return retValue;                                     \
   }
 
     ICCacheIRStub* cstub = stub->toCacheIRStub();
     const CacheIRStubInfo* stubInfo = cstub->stubInfo();
-    CacheIRReader cacheIRReader(stubInfo);
+    const uint8_t* stepCode = stubInfo->code();
+    CacheIRReader cacheIRReader(
+        stepCode + (stepping ? ctx.stepOff : 0),
+        stepCode + (stepping ? ctx.stepEnd : stubInfo->codeLength()));
     uint64_t retValue = 0;
     CacheOp cacheop;
 
-    WRITE_VALUE_REG(0, Value::fromRawBits(arg0));
-    WRITE_VALUE_REG(1, Value::fromRawBits(arg1));
-    WRITE_VALUE_REG(2, Value::fromRawBits(ctx.arg2));
+    if (stepping) {
+      retValue = ctx.stepRet;
+      ctx.stepEnd = 0;
+      ctx.stepDone = 0;
+      pblic::CountStep(stepCode + ctx.stepOff);
+    } else {
+      if (pblic::gDynStat) pblic::CountInterp(cstub);
+      WRITE_VALUE_REG(0, Value::fromRawBits(arg0));
+      WRITE_VALUE_REG(1, Value::fromRawBits(arg1));
+      WRITE_VALUE_REG(2, Value::fromRawBits(ctx.arg2));
+    }
 
     DISPATCH_CACHEOP();
 
@@ -916,6 +1093,7 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
 
       CACHEOP_CASE(PblReturn) {
         TRACE_PRINTF("stub successful!\n");
+        if (stepping) ctx.stepDone = 1;
         return retValue;
       }
 
@@ -1071,8 +1249,9 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
           DISPATCH_CACHEOP();
         } else if (val.isDouble()) {
           double doubleVal = val.toDouble();
-          if (int32_t(doubleVal) == doubleVal) {
-            WRITE_REG(resultId.id(), int32_t(doubleVal), INT32);
+          int32_t intVal;
+          if (PblExactInt32(doubleVal, &intVal)) {
+            WRITE_REG(resultId.id(), intVal, INT32);
             DISPATCH_CACHEOP();
           }
         }
@@ -1935,6 +2114,31 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
         DISPATCH_CACHEOP();
       }
 
+      CACHEOP_CASE(StoreFixedSlotUndefinedResult) {
+        // PBL adapter (UnsafeSetReservedSlot intrinsic): mirrors
+        // CacheIRCompiler::emitStoreFixedSlotUndefinedResult -- pre-barrier,
+        // store, post-barrier, result undefined. The barriered store is the
+        // same as StoreFixedSlot above (GCPtr<Value>::set). PBL_FOROF_IC=0
+        // keeps it unimplemented (stub fails, as before).
+        if (!PblForOfIcOn()) {
+          PblUnimplHit(uint32_t(CacheOp::StoreFixedSlotUndefinedResult));
+          FAIL_IC();
+        }
+        ObjOperandId objId = cacheIRReader.objOperandId();
+        uint32_t offsetOffset = cacheIRReader.stubOffset();
+        ValOperandId rhsId = cacheIRReader.valOperandId();
+        uintptr_t offset = stubInfo->getStubRawInt32(cstub, offsetOffset);
+        NativeObject* nobj =
+            reinterpret_cast<NativeObject*>(READ_REG(objId.id()));
+        GCPtr<Value>* slot = reinterpret_cast<GCPtr<Value>*>(
+            reinterpret_cast<uintptr_t>(nobj) + offset);
+        Value val = READ_VALUE_REG(rhsId.id());
+        slot->set(val);
+        retValue = UndefinedValue().asRawBits();
+        PREDICT_RETURN();
+        DISPATCH_CACHEOP();
+      }
+
       CACHEOP_CASE(StoreDynamicSlot) {
         ObjOperandId objId = cacheIRReader.objOperandId();
         uint32_t offsetOffset = cacheIRReader.stubOffset();
@@ -2258,16 +2462,31 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
       }
 
       CACHEOP_CASE(CallScriptedFunction)
-      CACHEOP_CASE_FALLTHROUGH(CallNativeFunction) {
-        bool isNative = cacheop == CacheOp::CallNativeFunction;
+      CACHEOP_CASE_FALLTHROUGH(CallNativeFunction)
+      CACHEOP_CASE_FALLTHROUGH(CallDOMFunction)
+      CACHEOP_CASE_FALLTHROUGH(CallDOMFunctionWithAllocSite) {
+        // DOM methods (PBL adapter): CacheIR attaches these for DOM `this`
+        // objects; the stub's guards already checked the |this| shape and
+        // the callee, so calling the method's JSNative (which unwraps
+        // |this| itself) is the same call CallNativeFunction makes.
+        bool isDOM = cacheop == CacheOp::CallDOMFunction ||
+                     cacheop == CacheOp::CallDOMFunctionWithAllocSite;
+        bool isNative = cacheop == CacheOp::CallNativeFunction || isDOM;
         TRACE_PRINTF("CallScriptedFunction / CallNativeFunction (native: %d)\n",
                      isNative);
         ObjOperandId calleeId = cacheIRReader.objOperandId();
         Int32OperandId argcId = cacheIRReader.int32OperandId();
+        if (isDOM) {
+          (void)cacheIRReader.objOperandId();  // thisObj
+        }
         CallFlags flags = cacheIRReader.callFlags();
         uint32_t argcFixed = cacheIRReader.uint32Immediate();
         bool ignoresRv = false;
-        if (isNative) {
+        if (isDOM) {
+          if (cacheop == CacheOp::CallDOMFunctionWithAllocSite) {
+            (void)cacheIRReader.stubOffset();  // site
+          }
+        } else if (isNative) {
           ignoresRv = cacheIRReader.readBool();
         }
 
@@ -2483,6 +2702,18 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
               "instead)\n",
               int(callee->nargs()));
           FAIL_IC();
+        }
+
+        // PBLBC_GETTER: the compiled GetProp op calls the getter itself
+        // (every guard of this stub has passed; nothing follows this op).
+        // A PblIc step of the stub's last op returns its result as is.
+        if (!isSetter && ctx.getterReq && !cacheIRReader.more() &&
+            (!stepping || stepEndIn == stubInfo->codeLength())) {
+          ctx.getterReq = 0;
+          ctx.getterFn = callee;
+          ctx.getterRecv = receiver.asRawBits();
+          ctx.getterStub = cstub;
+          return PBL_GETTER_SENTINEL();
         }
 
         {
@@ -3818,8 +4049,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
           FAIL_IC();
         }
         double result = std::floor(input);
-        int32_t intResult = int32_t(result);
-        if (double(intResult) != result) {
+        int32_t intResult;
+        if (!PblExactInt32(result, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
@@ -3834,8 +4065,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
           FAIL_IC();
         }
         double result = std::ceil(input);
-        int32_t intResult = int32_t(result);
-        if (double(intResult) != result) {
+        int32_t intResult;
+        if (!PblExactInt32(result, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
@@ -3846,12 +4077,12 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
       CACHEOP_CASE(MathTruncToInt32Result) {
         NumberOperandId inputId = cacheIRReader.numberOperandId();
         double input = READ_VALUE_REG(inputId.id()).toNumber();
-        if (input == 0.0 && std::signbit(input)) {
+        if (input > -1.0 && std::signbit(input)) {
           FAIL_IC();
         }
         double result = std::trunc(input);
-        int32_t intResult = int32_t(result);
-        if (double(intResult) != result) {
+        int32_t intResult;
+        if (!PblExactInt32(result, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
@@ -3865,8 +4096,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
         if (input == 0.0 && std::signbit(input)) {
           FAIL_IC();
         }
-        int32_t intResult = int32_t(input);
-        if (double(intResult) != input) {
+        int32_t intResult;
+        if (!PblExactInt32(input, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
@@ -3978,8 +4209,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
         if (std::isnan(input)) {
           FAIL_IC();
         }
-        int32_t result = int32_t(input);
-        if (double(result) != input) {
+        int32_t result;
+        if (!PblExactInt32(input, &result)) {
           FAIL_IC();
         }
         retValue = Int32Value(result).asRawBits();
@@ -4407,6 +4638,50 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
             return IC_ERROR_SENTINEL();
           }
           retValue = resultRooted.asRawBits();
+        }
+        PREDICT_RETURN();
+        DISPATCH_CACHEOP();
+      }
+
+      CACHEOP_CASE(CallDOMGetterResult) {
+        // PBL adapter: the DOM getter through the same VM helper Baseline
+        // calls (jit::CallDOMGetter); guards precede this op in the stub.
+        ObjOperandId objId = cacheIRReader.objOperandId();
+        uint32_t jitInfoOffset = cacheIRReader.stubOffset();
+        JSObject* obj = reinterpret_cast<JSObject*>(READ_REG(objId.id()));
+        const JSJitInfo* info = reinterpret_cast<const JSJitInfo*>(
+            stubInfo->getStubRawWord(cstub, jitInfoOffset));
+        {
+          PUSH_IC_FRAME();
+          ReservedRooted<JSObject*> objRooted(&ctx.state.obj0, obj);
+          ReservedRooted<Value> resultRooted(&ctx.state.value1);
+          if (!CallDOMGetter(cx, info, objRooted, &resultRooted)) {
+            ctx.error = PBIResult::Error;
+            return IC_ERROR_SENTINEL();
+          }
+          retValue = resultRooted.asRawBits();
+        }
+        PREDICT_RETURN();
+        DISPATCH_CACHEOP();
+      }
+
+      CACHEOP_CASE(CallDOMSetter) {
+        // PBL adapter: jit::CallDOMSetter, as Baseline does.
+        ObjOperandId objId = cacheIRReader.objOperandId();
+        uint32_t jitInfoOffset = cacheIRReader.stubOffset();
+        ValOperandId rhsId = cacheIRReader.valOperandId();
+        JSObject* obj = reinterpret_cast<JSObject*>(READ_REG(objId.id()));
+        Value rhs = READ_VALUE_REG(rhsId.id());
+        const JSJitInfo* info = reinterpret_cast<const JSJitInfo*>(
+            stubInfo->getStubRawWord(cstub, jitInfoOffset));
+        {
+          PUSH_IC_FRAME();
+          ReservedRooted<JSObject*> objRooted(&ctx.state.obj0, obj);
+          ReservedRooted<Value> rhsRooted(&ctx.state.value1, rhs);
+          if (!CallDOMSetter(cx, info, objRooted, rhsRooted)) {
+            ctx.error = PBIResult::Error;
+            return IC_ERROR_SENTINEL();
+          }
         }
         PREDICT_RETURN();
         DISPATCH_CACHEOP();
@@ -5410,13 +5685,18 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
 #define CACHEOP_UNIMPL(name, ...)               \
   cacheop_##name : __attribute__((unused));     \
   TRACE_PRINTF("unknown CacheOp: " #name "\n"); \
+  PblUnimplHit(uint32_t(CacheOp::name));        \
   FAIL_IC();
   CACHE_IR_OPS(CACHEOP_UNIMPL)
 #undef CACHEOP_UNIMPL
 
 next_ic:
   TRACE_PRINTF("IC failed; next IC\n");
-  return CallNextIC(arg0, arg1, stub, ctx);
+  {
+    uint64_t result = CallNextIC(arg0, arg1, stub, ctx);
+    if (stepping) ctx.stepDone = 0;
+    return result;
+  }
 }
 
 static MOZ_NEVER_INLINE uint64_t CallNextIC(uint64_t arg0, uint64_t arg1,
@@ -5768,8 +6048,80 @@ uint8_t* GetPortableFallbackStub(BaselineICFallbackKind kind) {
   }
 }
 
+#include "PblTierObserve.h"
+#include "PblIc.inc"
+#include "PblMethod.inc"
+
+// PBL_GENRESUME (default on; a value starting with '0' keeps the C++
+// interpreter for generator bodies) admits generator/async scripts to PBL and
+// resumes suspended generators in a PBL frame (JSOp::Resume).
+static bool PblGenResumeOn() {
+  static const bool on = [] {
+    const char* e = getenv("PBL_GENRESUME");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
+
+// Nesting depth of PortableBaselineInterpret runs on this thread. Every
+// nested C++ -> JS entry (PortableBaselineTrampoline and ICInterpretOps'
+// scripted getter/setter/call stubs) starts a non-restart run that nests
+// several KB of the host engine's own wasm call stack, which
+// AutoCheckRecursionLimit and Stack::check (linear memory only) cannot see;
+// past ~150 levels the host traps and the thread is lost. The non-restart
+// run counts itself for its whole C++ lifetime (its restart continuation is
+// called from, and returns through, that same frame), so an RAII guard
+// decrements exactly once on every return path. Over the limit the run
+// reports over-recursion like the stack checks. PBL_NESTMAX=N (N > 0)
+// overrides the default, read once. Default 80 is ~2/3 of the shallowest
+// level measured safe in a browser worker (120 with tiers on; c80 notes).
+static constexpr uint32_t kPblNestMaxDefault = 80;
+static thread_local uint32_t tPblNest;
+static uint32_t PblNestMax() {
+  static const uint32_t max = [] {
+    const char* e = getenv("PBL_NESTMAX");
+    if (e && e[0] >= '1' && e[0] <= '9') {
+      char* end = nullptr;
+      unsigned long v = strtoul(e, &end, 10);
+      if (end && *end == '\0') {
+        return v > 0xFFFFFFF0ul ? uint32_t(0xFFFFFFF0u) : uint32_t(v);
+      }
+    }
+    return kPblNestMaxDefault;
+  }();
+  return max;
+}
+class MOZ_RAII PblNestGuard {
+  const bool counted_;
+
+ public:
+  explicit PblNestGuard(bool count) : counted_(count) {
+    if (counted_) {
+      tPblNest++;
+    }
+  }
+  ~PblNestGuard() {
+    if (counted_) {
+      MOZ_ASSERT(tPblNest > 0);
+      tPblNest--;
+    }
+  }
+  PblNestGuard(const PblNestGuard&) = delete;
+  void operator=(const PblNestGuard&) = delete;
+  bool overLimit() const { return counted_ && tPblNest > PblNestMax(); }
+};
+
+// PBLBC_NATENTRY resume state handed from PblNatEnter to the restart-mode
+// run it continues in (restartCode Ok): the IC cursor and bcPending that the
+// non-restart run would have had at that dispatch.
+struct PblNatResume {
+  ICEntry* icEntry;
+  bool pending;
+};
+static thread_local PblNatResume tPblNatResume;
+
 uint8_t* GetICInterpreter() {
-  return reinterpret_cast<uint8_t*>(&ICInterpretOps);
+  return reinterpret_cast<uint8_t*>(&PblIcEntry);
 }
 
 /*
@@ -5810,8 +6162,9 @@ static EnvironmentObject& getEnvironmentFromCoordinate(
 #define LABEL(op) (&&label_##op)
 #ifdef ENABLE_COMPUTED_GOTO_DISPATCH
 #  define CASE(op) label_##op:
-#  define DISPATCH() \
-    DEBUG_CHECK();   \
+#  define DISPATCH()                         \
+    DEBUG_CHECK();                           \
+    if (MOZ_UNLIKELY(bcPending)) goto bc_hook; \
     goto* addresses[*pc]
 #else
 #  define CASE(op) label_##op : case JSOp::op:
@@ -5911,6 +6264,9 @@ PBIResult PortableBaselineInterpret(
     JSObject* envChain, Value* ret, jsbytecode* pc, ImmutableScriptData* isd,
     jsbytecode* restartEntryPC, BaselineFrame* restartFrame,
     StackVal* restartEntryFrame, PBIResult restartCode) {
+  // Declared before any label so no goto can bypass it; see PblNestGuard.
+  PblNestGuard nestGuard(!IsRestart);
+
 #define RESTART(code)                                                 \
   if (!IsRestart) {                                                   \
     TRACE_PRINTF("Restarting (code %d sp %p fp %p)\n", int(code), sp, \
@@ -5935,7 +6291,8 @@ PBIResult PortableBaselineInterpret(
   icEntries = frame->icScript()->icEntries();                       \
   icEntry = frame->interpreterICEntry();                            \
   argsObjAliasesFormals = frame->script()->argsObjAliasesFormals(); \
-  resumeOffsets = isd->resumeOffsets().data();
+  resumeOffsets = isd->resumeOffsets().data();                      \
+  bcPending = bcOn;
 
 #define OPCODE_LABEL(op, ...) LABEL(op),
 #define TRAILING_LABEL(v) LABEL(default),
@@ -5974,14 +6331,34 @@ PBIResult PortableBaselineInterpret(
   auto* icEntries = frame->icScript()->icEntries();
   auto* icEntry = icEntries;
   const uint32_t* resumeOffsets = isd->resumeOffsets().data();
+  // PblMethod hook: pending at entry, calls, returns, catches and loop heads.
+  const bool bcOn = pblbc::Enabled();
+  bool bcPending = bcOn;
+  // PBLBC_TRAMPENTRY: the compiled Entry TrampEntryReady found, handed to
+  // the first Hook call so it does not look the Entry up again.
+  pblbc::Entry* bcKnown = nullptr;
 
   if (IsRestart) {
+    if (restartCode == PBIResult::Ok) {
+      // PBLBC_NATENTRY: PblNatEnter ran the prologue (and possibly compiled
+      // code); continue at pc exactly like the non-restart run at the
+      // dispatch after its prologue / its bc_hook.
+      icEntry = tPblNatResume.icEntry;
+      bcPending = tPblNatResume.pending;
+      DEBUG_CHECK();
+      goto* addresses[*pc];
+    }
     ic_result = restartCode;
     TRACE_PRINTF(
         "Enter from restart: sp = %p ctx.stack.fp = %p ctx.frame = %p\n", sp,
         ctx.stack.fp, ctx.frame);
     goto ic_fail;
   } else {
+    if (MOZ_UNLIKELY(nestGuard.overLimit())) {
+      PUSH_EXIT_FRAME();
+      ReportOverRecursed(ctx.frameMgr.cxForLocalUseOnly());
+      return PBIResult::Error;
+    }
     AutoCheckRecursionLimit recursion(ctx.frameMgr.cxForLocalUseOnly());
     if (!recursion.checkDontReport(ctx.frameMgr.cxForLocalUseOnly())) {
       PUSH_EXIT_FRAME();
@@ -6057,6 +6434,14 @@ PBIResult PortableBaselineInterpret(
                sp, ctx.stack.fp, frame, frame->script(), pc);
   TRACE_PRINTF("nslots = %d nfixed = %d\n", int(frame->script()->nslots()),
                int(frame->script()->nfixed()));
+
+  // PBLBC_TRAMPENTRY: the prologue above is complete; enter already-compiled
+  // method-tier code at op 0 through the normal Hook continuation (exits,
+  // frame switches, errors and Return/RetRval all continue in this run
+  // exactly as after a Hook at any other op).
+  if (bcOn && (bcKnown = pblbc::TrampEntryReady(frame, pc, isd))) {
+    goto bc_hook;
+  }
 
   while (true) {
     DEBUG_CHECK();
@@ -7820,7 +8205,7 @@ PBIResult PortableBaselineInterpret(
                 "Call fastpath: argc = %d origArgs = %p callee = %" PRIx64 "\n",
                 argc, origArgs, callee.get().asRawBits());
 
-            if (!ctx.stack.check(sp, sizeof(StackVal) * (totalArgs + 3))) {
+            if (!ctx.stack.checkJS(sp, sizeof(StackVal) * (totalArgs + 3))) {
               TRACE_PRINTF("missed fastpath: would cause stack overrun\n");
               break;
             }
@@ -7888,7 +8273,7 @@ PBIResult PortableBaselineInterpret(
             sp = reinterpret_cast<StackVal*>(frame);
             RESET_PC(calleeScript->code(), calleeScript);
             // 7. Check callee stack space for max stack depth.
-            if (!stack.check(sp, sizeof(StackVal) * calleeScript->nslots())) {
+            if (!stack.checkJS(sp, sizeof(StackVal) * calleeScript->nslots())) {
               PUSH_EXIT_FRAME();
               ReportOverRecursed(ctx.frameMgr.cxForLocalUseOnly());
               GOTO_ERROR();
@@ -8208,6 +8593,97 @@ PBIResult PortableBaselineInterpret(
 
       CASE(Resume) {
         // rval, gen, resumeKind => rval
+        if (PblGenResumeOn()) {
+          // Resume in a PBL frame, as Baseline's emit_Resume plus
+          // emitGeneratorResumePrologueBody do. Nothing below can GC until
+          // DISPATCH; every check happens before the first push.
+          AbstractGeneratorObject* gen =
+              &VIRTSP(2).asValue().toObject().as<AbstractGeneratorObject>();
+          JSContext* lcx = ctx.frameMgr.cxForLocalUseOnly();
+          do {
+            if (!gen->isSuspended() || gen->isModuleGenerator()) {
+              break;
+            }
+            JSFunction* gfun = &gen->callee();
+            if (!gfun->hasBaseScript() || !gfun->baseScript()->hasBytecode()) {
+              break;
+            }
+            JSScript* gscript = gfun->baseScript()->asJSScript();
+            if (!gscript->hasJitScript() || gscript->isDebuggee() ||
+                gscript->hasScriptCounts() || frame->isDebuggee()) {
+              break;
+            }
+            if (lcx->realm() != gscript->realm() ||
+                lcx->realm()->collectCoverageForDebug()) {
+              break;
+            }
+            const bool needsArgsObj = gscript->needsArgsObj();
+            if (needsArgsObj && !gen->hasArgsObj()) {
+              break;
+            }
+            ArrayObject* storage =
+                gen->hasStackStorage() ? &gen->stackStorage() : nullptr;
+            uint32_t len = storage ? storage->getDenseInitializedLength() : 0;
+            uint32_t nfixed = gscript->nfixed();
+            uint32_t nslots = gscript->nslots();
+            if (len > nslots) {
+              break;
+            }
+            uint32_t nformals = gfun->nargs();
+            if (!ctx.stack.checkJS(sp, sizeof(StackVal) *
+                                               (nformals + 1 + nslots + 2 + 16) +
+                                           BaselineFrame::Size())) {
+              break;
+            }
+            Value resumeVal = VIRTSP(1).asValue();
+            Value resumeKindVal = VIRTSP(0).asValue();
+            uint32_t resumeIndex = gen->resumeIndex();
+
+            frame->interpreterPC() = pc;
+            frame->interpreterICEntry() = icEntry;
+            StackVal* exitFP = ctx.stack.pushExitFrame(sp, frame);
+            MOZ_ASSERT(exitFP);  // safety: checked above.
+            sp = exitFP;
+            PUSHNATIVE(StackValNative(nullptr));
+            // Formals and `this` are undefined (numActualArgs = 0), as in
+            // Baseline and InterpreterFrame resumption.
+            for (uint32_t i = 0; i < nformals + 1; i++) {
+              VIRTPUSH(StackVal(UndefinedValue()));
+            }
+            PUSHNATIVE(StackValNative(CalleeToToken(gfun, false)));
+            PUSHNATIVE(StackValNative(
+                MakeFrameDescriptorForJitCall(FrameType::BaselineStub, 0)));
+            PUSHNATIVE(StackValNative(nullptr));
+            BaselineFrame* newFrame =
+                ctx.stack.pushFrame(sp, lcx, &gen->environmentChain());
+            MOZ_ASSERT(newFrame);  // safety: checked above.
+            frame = newFrame;
+            ctx.frameMgr.switchToFrame(frame);
+            ctx.frame = frame;
+            frame->setFlag(BaselineFrame::Flags::HAS_INITIAL_ENV);
+            if (needsArgsObj) {
+              frame->initArgsObjUnchecked(gen->argsObj());
+            }
+            sp = reinterpret_cast<StackVal*>(frame);
+            gen->setRunning();
+            for (uint32_t i = 0; i < len; i++) {
+              VIRTPUSH(StackVal(storage->getDenseElement(i)));
+            }
+            for (uint32_t i = len; i < nfixed; i++) {
+              VIRTPUSH(StackVal(UndefinedValue()));
+            }
+            if (len) {
+              // Pre-barriered by NativeObject.
+              storage->setDenseInitializedLength(0);
+            }
+            VIRTPUSH(StackVal(resumeVal));
+            VIRTPUSH(StackVal(resumeKindVal));
+            ret->setUndefined();
+            RESET_PC(gscript->code() + gscript->resumeOffsets()[resumeIndex],
+                     gscript);
+            DISPATCH();
+          } while (0);
+        }
         {
           GeneratorResumeKind resumeKind =
               IntToResumeKind(VIRTSP(0).asValue().toInt32());
@@ -8240,6 +8716,7 @@ PBIResult PortableBaselineInterpret(
       CASE(LoopHead) {
         int32_t icIndex = GET_INT32(pc);
         icEntry = icEntries + icIndex;
+        bcPending = bcOn;
 #ifdef ENABLE_INTERRUPT_CHECKS
         if (ctx.frameMgr.cxForLocalUseOnly()->hasAnyPendingInterrupt()) {
           PUSH_EXIT_FRAME();
@@ -8405,6 +8882,16 @@ PBIResult PortableBaselineInterpret(
           // Adjust caller's stack to complete the call op that PC still points
           // to in that frame (pop args, push return value).
           JSOp op = JSOp(*pc);
+          if (op == JSOp::Resume) {
+            // PBL_GENRESUME frame: rval, gen, resumeKind => rval.
+            VIRTPOPN(3);
+            VIRTPUSH(StackVal(ret));
+            if (!ok) {
+              GOTO_ERROR();
+            }
+            ADVANCE(JSOpLength_Resume);
+            DISPATCH();
+          }
           bool constructing = (op == JSOp::New || op == JSOp::NewContent ||
                                op == JSOp::SuperCall);
           // Fix-up return value; EnterJit would do this if we hadn't bypassed
@@ -8426,7 +8913,9 @@ PBIResult PortableBaselineInterpret(
 
           // Advance past call instruction, and advance past IC.
           NEXT_IC();
-          ADVANCE(JSOpLength_Call);
+          // PBLBC_GETTER: a getter called directly from a compiled GetProp
+          // returns here with pc at that GetProp (argc 0, one IC entry).
+          ADVANCE(op == JSOp::GetProp ? JSOpLength_GetProp : JSOpLength_Call);
 
           DISPATCH();
         }
@@ -9160,6 +9649,37 @@ error:
 
   DISPATCH();
 
+bc_hook: {
+  bcPending = false;
+  pblbc::Entry* const known = bcKnown;
+  bcKnown = nullptr;
+  if (!frame->isDebuggee()) {
+    pblbc::Out bo;
+    int r = pblbc::Hook(frame, sp, pc, entryPC, isd, icEntries, icEntry,
+                        argsObjAliasesFormals, ctx, &bo, known);
+    if (r == pblbc::kPending) {
+      bcPending = true;
+    } else if (r >= pblbc::kRan) {
+      if (r >= pblbc::kRanNewFrame) {
+        // Compiled code pushed a callee frame (PBLBC_DIRECT) exactly like
+        // the Call fast path and stopped in it: switch all per-frame state.
+        frame = bo.frame;
+        RESET_PC(bo.pc, frame->script());
+      }
+      sp = bo.sp;
+      pc = bo.pc;
+      icEntry = bo.icEntry;
+      bcPending = true;
+      if (r == pblbc::kRanIcError || r == pblbc::kRanNewFrameIcError) {
+        ic_result = ctx.error;
+        goto ic_fail;
+      }
+    }
+  }
+  DEBUG_CHECK();
+  goto* addresses[*pc];
+}
+
 ic_fail:
   RESTART(ic_result);
   switch (ic_result) {
@@ -9256,6 +9776,158 @@ debug:;
  * -----------------------------------------------
  */
 
+// PBLBC_NATENTRY (PblMethod.inc gNatEntry): the prologue of a non-restart
+// PortableBaselineInterpret run, in the same order with the same checks and
+// error returns, then the PBLBC_TRAMPENTRY Hook at op 0, without entering
+// the interpreter's large function. A Return/RetRval exit of this (entry)
+// frame completes as CASE(Return)/do_return does for the entry frame. Every
+// other outcome (TrampEntryReady null, Hook kNone/kPending, exits mid-script,
+// frame switches) continues in a restart-mode run at the same dispatch
+// (restartCode Ok, tPblNatResume); errors after the frame push restart with
+// PBIResult::Error exactly as GOTO_ERROR / ic_fail's RESTART do. The nest
+// guard counts this level once for the whole call, as the non-restart run
+// does (its restart continuation runs inside it).
+template <bool HybridICs>
+static PBIResult PblNatEnter(JSContext* cx_, State& state, Stack& stack,
+                             StackVal* sp, JSObject* envChain, Value* ret,
+                             jsbytecode* pc, ImmutableScriptData* isd) {
+  PblNestGuard nestGuard(true);
+  PUSHNATIVE(StackValNative(nullptr));  // Fake return address.
+  BaselineFrame* frame = stack.pushFrame(sp, cx_, envChain);
+  MOZ_ASSERT(frame);  // safety: stack margin.
+  sp = reinterpret_cast<StackVal*>(frame);
+  StackVal* const entryFrame = sp;
+  jsbytecode* entryPC = pc;
+  const uint32_t nfixed = frame->script()->nfixed();
+  ICCtx ctx(cx_, frame, state, stack);
+  ICEntry* const icEntries = frame->icScript()->icEntries();
+  PBIResult restartCode = PBIResult::Ok;
+  pblbc::Entry* known = nullptr;
+  pblbc::Out bo;
+  int r = pblbc::kNone;
+  tPblNatResume.icEntry = icEntries;
+  tPblNatResume.pending = true;
+
+  if (MOZ_UNLIKELY(nestGuard.overLimit())) {
+    PUSH_EXIT_FRAME();
+    ReportOverRecursed(ctx.frameMgr.cxForLocalUseOnly());
+    return PBIResult::Error;
+  }
+  {
+    AutoCheckRecursionLimit recursion(ctx.frameMgr.cxForLocalUseOnly());
+    if (!recursion.checkDontReport(ctx.frameMgr.cxForLocalUseOnly())) {
+      PUSH_EXIT_FRAME();
+      ReportOverRecursed(ctx.frameMgr.cxForLocalUseOnly());
+      return PBIResult::Error;
+    }
+  }
+  if (!ctx.stack.check(sp, sizeof(StackVal) * frame->script()->nslots())) {
+    PUSH_EXIT_FRAME();
+    ReportOverRecursed(ctx.frameMgr.cxForLocalUseOnly());
+    return PBIResult::Error;
+  }
+
+  sp -= nfixed;
+  for (uint32_t i = 0; i < nfixed; i++) {
+    sp[i] = StackVal(UndefinedValue());
+  }
+  ret->setUndefined();
+
+  if (frame->script()->isDebuggee()) {
+    frame->setIsDebuggee();
+  }
+  if (CalleeTokenIsFunction(frame->calleeToken())) {
+    JSFunction* func = CalleeTokenToFunction(frame->calleeToken());
+    frame->setEnvironmentChain(func->environment());
+    if (func->needsFunctionEnvironmentObjects()) {
+      PUSH_EXIT_FRAME();
+      if (!js::InitFunctionEnvironmentObjects(cx, frame)) {
+        restartCode = PBIResult::Error;
+        goto restart;
+      }
+    }
+  }
+  if (frame->script()->isDebuggee()) {
+    PUSH_EXIT_FRAME();
+    if (!DebugPrologue(cx, frame)) {
+      restartCode = PBIResult::Error;
+      goto restart;
+    }
+  }
+  if (!frame->script()->hasScriptCounts()) {
+    if (ctx.frameMgr.cxForLocalUseOnly()->realm()->collectCoverageForDebug()) {
+      PUSH_EXIT_FRAME();
+      if (!frame->script()->initScriptCounts(cx)) {
+        restartCode = PBIResult::Error;
+        goto restart;
+      }
+    }
+  }
+  COUNT_COVERAGE_MAIN();
+#ifdef ENABLE_INTERRUPT_CHECKS
+  if (ctx.frameMgr.cxForLocalUseOnly()->hasAnyPendingInterrupt()) {
+    PUSH_EXIT_FRAME();
+    if (!InterruptCheck(cx)) {
+      restartCode = PBIResult::Error;
+      goto restart;
+    }
+  }
+#endif
+
+  // As the non-restart run: TrampEntryReady, then bc_hook (not a debuggee
+  // frame: TrampEntryReady checked it and nothing ran since).
+  known = pblbc::TrampEntryReady(frame, pc, isd);
+  if (!known) {
+    goto resume;  // dispatch op 0 with bcPending = bcOn (true)
+  }
+  r = pblbc::Hook(frame, sp, pc, entryPC, isd, icEntries, icEntries,
+                  frame->script()->argsObjAliasesFormals(), ctx, &bo, known);
+  if (r == pblbc::kNone || r == pblbc::kPending) {
+    tPblNatResume.pending = (r == pblbc::kPending);
+    goto resume;
+  }
+  if (r == pblbc::kRan) {
+    JSOp xop = JSOp(*bo.pc);
+    if ((xop == JSOp::Return || xop == JSOp::RetRval) &&
+        !frame->isDebuggee() &&
+        reinterpret_cast<uintptr_t>(stack.fp) ==
+            reinterpret_cast<uintptr_t>(entryFrame) + BaselineFrame::Size() &&
+        reinterpret_cast<uintptr_t>(
+            reinterpret_cast<StackValNative*>(stack.fp)->asVoidPtr()) >
+            reinterpret_cast<uintptr_t>(entryFrame)) {
+      // CASE(Return) / do_return for the entry frame (not a debuggee, not
+      // from unwind): pop the frame and hand back the return value.
+      if (xop == JSOp::Return) {
+        frame->setReturnValue(bo.sp->asValue());
+      }
+      (void)stack.popFrame();
+      *ret = frame->returnValue();
+      if (MOZ_UNLIKELY(pblbc::gExitStat)) pblbc::gNeDirect++;
+      return PBIResult::Ok;
+    }
+  }
+  if (r >= pblbc::kRanNewFrame) {
+    frame = bo.frame;
+    entryPC = frame->script()->code();
+    isd = frame->script()->immutableScriptData();
+  }
+  sp = bo.sp;
+  pc = bo.pc;
+  tPblNatResume.icEntry = bo.icEntry;
+  if (r == pblbc::kRanIcError || r == pblbc::kRanNewFrameIcError) {
+    restartCode = ctx.error;
+    goto restart;
+  }
+
+resume:
+  if (MOZ_UNLIKELY(pblbc::gExitStat)) pblbc::gNeFallback++;
+  restartCode = PBIResult::Ok;
+restart:
+  return PortableBaselineInterpret<true, HybridICs>(
+      ctx.frameMgr.cxForLocalUseOnly(), ctx.state, ctx.stack, sp, envChain, ret,
+      pc, isd, entryPC, frame, entryFrame, restartCode);
+}
+
 bool PortableBaselineTrampoline(JSContext* cx, size_t argc, Value* argv,
                                 size_t numFormals, CalleeToken calleeToken,
                                 JSObject* envChain, Value* result) {
@@ -9314,9 +9986,14 @@ bool PortableBaselineTrampoline(JSContext* cx, size_t argc, Value* argv,
   jsbytecode* pc = script->code();
   ImmutableScriptData* isd = script->immutableScriptData();
   PBIResult ret;
-  ret = PortableBaselineInterpret<false, kHybridICsInterp>(
-      cx, state, stack, sp, envChain, result, pc, isd, nullptr, nullptr,
-      nullptr, PBIResult::Ok);
+  if (pblbc::Enabled() && pblbc::NatEntryReady(script, isd)) {
+    ret = PblNatEnter<kHybridICsInterp>(cx, state, stack, sp, envChain, result,
+                                        pc, isd);
+  } else {
+    ret = PortableBaselineInterpret<false, kHybridICsInterp>(
+        cx, state, stack, sp, envChain, result, pc, isd, nullptr, nullptr,
+        nullptr, PBIResult::Ok);
+  }
   switch (ret) {
     case PBIResult::Ok:
     case PBIResult::UnwindRet:
@@ -9348,10 +10025,25 @@ MethodStatus CanEnterPortableBaselineInterpreter(JSContext* cx,
   if (!JitOptions.portableBaselineInterpreter) {
     return MethodStatus::Method_CantCompile;
   }
+  const bool debuggee = state.script()->isDebuggee();
+  const bool coverage = state.script()->hasScriptCounts() ||
+                        cx->realm()->collectCoverageForDebug();
+  if (debuggee || coverage) {
+    if (debuggee) {
+      js::pbljit::ObserveSkip(state.script(), state.script()->code(), cx,
+                            "skip-debuggee");
+    }
+    if (coverage) {
+      js::pbljit::ObserveSkip(state.script(), state.script()->code(), cx,
+                            "skip-coverage");
+    }
+    return MethodStatus::Method_CantCompile;
+  }
   if (state.script()->hasJitScript()) {
     return MethodStatus::Method_Compiled;
   }
-  if (state.script()->isAsync() || state.script()->isGenerator()) {
+  if (!PblGenResumeOn() &&
+      (state.script()->isAsync() || state.script()->isGenerator())) {
     return MethodStatus::Method_CantCompile;
   }
   if (cx->runtime()->geckoProfiler().enabled()) {
@@ -9368,18 +10060,34 @@ MethodStatus CanEnterPortableBaselineInterpreter(JSContext* cx,
       return MethodStatus::Method_CantCompile;
     }
   }
+  // The C++ interpreter cannot OSR into the portable tier at a loop head.
+  // Admit loop scripts here so a long first invocation can reach the native
+  // loop hotness checks. Straight-line scripts keep invocation warmup.
   if (state.script()->getWarmUpCount() <=
-      JitOptions.portableBaselineInterpreterWarmUpThreshold) {
+          JitOptions.portableBaselineInterpreterWarmUpThreshold &&
+      !state.script()->hasLoops()) {
     return MethodStatus::Method_Skipped;
   }
-  // After warmup and before first JitScript allocation: retain C++ exception policy.
+  // Before first JitScript allocation, retain the C++ exception policy for both
+  // warmed scripts and first-invocation loops.
   bool reject = false;
+  // Unset or PBL_TRYPOLICY=0 admits Catch/Finally scripts (PBL unwinds them
+  // itself); PBL_TRYPOLICY=1 (any other set value) keeps the C++ interpreter
+  // exception policy.
+  static const bool tryPolicy = [] {
+    const char* e = getenv("PBL_TRYPOLICY");
+    return e && !(e[0] == '0' && e[1] == '\0');
+  }();
   for (const auto& note : state.script()->trynotes()) {
-    reject |= note.kind() == TryNoteKind::Catch ||
-              note.kind() == TryNoteKind::Finally;
+    reject |= tryPolicy && (note.kind() == TryNoteKind::Catch ||
+                            note.kind() == TryNoteKind::Finally);
   }
+  // Throw ops alone no longer keep a script in the C++ interpreter: hot
+  // functions with cold error paths (WebGL helper libraries) ran there
+  // forever. PBLIC=0 restores the old rule for A/B comparisons.
   for (jsbytecode* pc = state.script()->code();
-       !reject && pc < state.script()->codeEnd(); pc += GetBytecodeLength(pc)) {
+       !reject && !pblic::Enabled() && pc < state.script()->codeEnd();
+       pc += GetBytecodeLength(pc)) {
     JSOp op = JSOp(*pc);
     reject = op == JSOp::Throw || op == JSOp::ThrowWithStack;
   }

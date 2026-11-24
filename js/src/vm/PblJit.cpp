@@ -20,11 +20,18 @@
 // agree on all types. A head-live var holding an Array (class-guarded at
 // entry, never written in the loop) supports dense in-bounds GetElem/SetElem
 // of numbers and `.length`; holes, out-of-bounds indices, frozen elements and
-// unexpected element types bail. Never-replaced PlainObjects support own
+// unexpected element types bail. The same var may instead hold a
+// fixed-length Int32Array/Float64Array (bounds-checked against its current
+// length slot; Int32 stores only; `.length` is not compiled because it is an
+// inherited, redefinable accessor, so such loops must bound by a number, e.g.
+// `i < n`) or an Array whose elements are Arrays
+// ("rows": each row read checks the object tag and ArrayObject class, then
+// the dense element rules above apply). Never-replaced PlainObjects support own
 // numeric slots behind entry shape guards; tenured global/object constants
 // support hoisted identity guards and allocation-free Math operations.
 // Cache entries are invalidated on script/major-GC changes and skipped during
-// incremental GC. Vars read before
+// compacting incremental GCs (all incremental GCs with PBLJIT_INCRGC=0; see
+// OnLoopHead for the invariant). Vars read before
 // being written in an iteration are type-guarded at entry and must keep that
 // type around the loop; the others are reloaded from the frame each
 // iteration. The code leaves the loop at:
@@ -54,6 +61,8 @@
 
 #ifdef PBLJIT_HOST_TEST
 #  include "host-test/mock.h"  // host emitter test (tools/pbl-jit/host-test)
+int MockTypedKind(uint32_t payload);  // fixed-length typed arrays (emit.cpp)
+int MockRowKind(uint32_t payload);    // Arrays of Arrays (emit.cpp)
 #else
 #  include "jit/BaselineFrame.h"
 #  include "jit/InlinableNatives.h"
@@ -67,6 +76,7 @@
 #  include "vm/Watchtower.h"
 #  include "vm/JSAtomUtils-inl.h"
 #  include "vm/ArrayObject.h"
+#  include "vm/TypedArrayObject.h"
 #  include "vm/BytecodeUtil.h"
 #  include "vm/JSContext.h"
 #  include "vm/JSScript.h"
@@ -110,6 +120,10 @@ void PrintObservation(const char* failure, const char* format, ...) {
   if (written != ssize_t(strlen(failure))) abort();
 }
 
+void ObserveLocation(const char* filename, unsigned line, unsigned off, JSContext* cx,
+                     const char* event, uint32_t fn, int64_t kind = -1,
+                     uint32_t sp = 0, int32_t delta = 0, uint32_t ic = 0);
+
 struct Exit {
   uint64_t* sp;
   int32_t pcDelta;
@@ -148,6 +162,8 @@ struct Entry {
 
 thread_local Entry* tCache;
 
+#include "PblCacheObserve.h"
+
 uint32_t CacheIndex(JSScript* script, const jsbytecode* pc) {
   // Firefox shares immutable bytecode between scripts with different atoms.
   // Include the script so those scripts do not continually evict each other.
@@ -163,10 +179,38 @@ uint32_t CacheIndex(JSScript* script, const jsbytecode* pc) {
 
 std::atomic<uint32_t> gInstalls{0};
 std::atomic<uint32_t> gCompiles{0};
+}  // namespace
+}  // namespace pbljit
+}  // namespace js
+// PBL_TIERSTAT / PBLBC_LATCHFIX interface with PblMethod.inc (another TU;
+// C linkage so it can be declared there without touching the PBI patch).
+// gPblTierStat is set once by PblMethod.inc's configuration; the counters
+// are main-thread statistics (racy across threads; diagnostics only).
+// gPblLoopMiss: why the last OnLoopHead on this thread returned false:
+// 0 a persistent refusal (rejected/disabled loop, NoEntry, argv refusal,
+// disabled), 1 a transient miss (incremental GC, counting phase, slot
+// collision, global mismatch, byte mismatch), 2 the loop's own entry was
+// just evicted because of a major GC.
+extern "C" {
+bool gPblTierStat = false;
+uint32_t gPblTsIncrSkip = 0, gPblTsEvictGc = 0, gPblTsDisable = 0;
+thread_local int gPblLoopMiss = 0;
+uint32_t PblJitCompiles() {
+  return js::pbljit::gCompiles.load(std::memory_order_relaxed);
+}
+// Accessor for PblMethod.inc: never declare gPblLoopMiss extern
+// thread_local in another TU (see PblMethod.inc).
+int PblJitLoopMiss() { return gPblLoopMiss; }
+bool PblJitIncrGCAllowed();
+}
+namespace js {
+namespace pbljit {
+namespace {
 std::atomic<uint32_t> gRejects{0};
 std::atomic<uint32_t> gRuns{0};
 std::atomic<uint32_t> gBails{0};
 std::atomic<int> gLogBudget{-1};
+std::atomic<bool> gLogEnabled{false};
 std::atomic<int> gEnabled{-1};
 
 bool Enabled() {
@@ -175,16 +219,47 @@ bool Enabled() {
     const char* v = getenv("PBLJIT");
     e = (v && v[0] == '0') ? 0 : 1;
     const char* l = getenv("PBLJIT_LOG");
-    gLogBudget.store(l ? atoi(l) : 24, std::memory_order_relaxed);
+    const int logBudget = l ? atoi(l) : 24;
+    gLogBudget.store(logBudget, std::memory_order_relaxed);
+    gLogEnabled.store(logBudget > 0, std::memory_order_relaxed);
     gEnabled.store(e, std::memory_order_relaxed);
-    if (e) {
-      fprintf(stderr, "PBLJIT enabled (threshold=%u, logBudget=%d)\n", kCompileHits, l ? atoi(l) : 24);
+    if (e && logBudget > 0) {
+      fprintf(stderr, "PBLJIT enabled (threshold=%u, logBudget=%d)\n", kCompileHits, logBudget);
     }
   }
   return e != 0;
 }
 
-bool TakeLog() { return gLogBudget.fetch_sub(1, std::memory_order_relaxed) > 0; }
+// PBLJIT_INCRGC (default on; 0: old behaviour, refuse during any incremental
+// GC): enter/compile loops during non-compacting incremental GCs.
+// PBLJIT_FASTRECOMP (default on; 0: old behaviour): a loop whose compiled
+// code was dropped by a major-GC epoch change recompiles on its next hit
+// instead of counting kCompileHits again.
+std::atomic<int> gIncrGC{-1};
+std::atomic<int> gFastRecomp{-1};
+bool EnvSwitch(std::atomic<int>& cell, const char* name) {
+  int v = cell.load(std::memory_order_relaxed);
+  if (v < 0) {
+    const char* s = getenv(name);
+    v = (s && s[0] == '0') ? 0 : 1;
+    cell.store(v, std::memory_order_relaxed);
+  }
+  return v != 0;
+}
+bool IncrGCAllowed() { return EnvSwitch(gIncrGC, "PBLJIT_INCRGC"); }
+bool FastRecomp() { return EnvSwitch(gFastRecomp, "PBLJIT_FASTRECOMP"); }
+}  // namespace
+}  // namespace pbljit
+}  // namespace js
+extern "C" bool PblJitIncrGCAllowed() { return js::pbljit::IncrGCAllowed(); }
+namespace js {
+namespace pbljit {
+namespace {
+
+bool TakeLog() {
+  return gLogEnabled.load(std::memory_order_relaxed) &&
+         gLogBudget.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
 
 // ---- wasm byte emitter ----------------------------------------------------
 
@@ -256,6 +331,7 @@ enum : uint8_t {
   W_F64CEIL = 0x9b, W_F64FLOOR = 0x9c, W_F64TRUNC = 0x9d,
   W_F64SQRT = 0x9f, W_F64MIN = 0xa4, W_F64MAX = 0xa5, W_F64COPYSIGN = 0xa6,
   W_I32TRUNCF64S = 0xaa, W_F64CONVI32S = 0xb7, W_F64REINTI64 = 0xbf,
+  W_F64LOAD = 0x2b,
 };
 
 // Value types of stack slots and frame variables. The numbering is
@@ -270,7 +346,12 @@ constexpr uint32_t kTagObject = 0xFFFFFF8Cu;
 constexpr bool IsArr(Ty t) { return uint8_t(t) >= 16 && uint8_t(t) < 48; }
 constexpr bool IsObj(Ty t) { return uint8_t(t) >= 48 && uint8_t(t) < 80; }
 constexpr bool IsConst(Ty t) { return uint8_t(t) >= 80 && uint8_t(t) < 96; }
-constexpr bool IsObject(Ty t) { return IsArr(t) || IsObj(t) || IsConst(t); }
+// A row: an Array object loaded from an element of another Array. Its wasm
+// local holds the pointer and its class was checked when it was loaded; its
+// elements are read as Int32 (kRowInt) or as numbers (kRowNum).
+constexpr Ty kRowInt = Ty(96), kRowNum = Ty(97);
+constexpr bool IsRow(Ty t) { return t == kRowInt || t == kRowNum; }
+constexpr bool IsObject(Ty t) { return IsArr(t) || IsObj(t) || IsConst(t) || IsRow(t); }
 constexpr Ty ObjTy(uint32_t v) { return Ty(48 + v); }
 constexpr uint32_t ObjVar(Ty t) { return uint8_t(t) - 48u; }
 constexpr Ty ConstTy(uint32_t v) { return Ty(80 + v); }
@@ -337,6 +418,7 @@ MathOp IdentifyMath(uint32_t pointer) { return MathOp(MockIdentifyMath(pointer))
 int32_t OffSlots() { return 4; }
 uint64_t MajorGC(JSContext* cx) { return cx->majorGC; }
 bool IncrementalGC(JSContext* cx) { return cx->incrementalGC; }
+bool CompactingGC(JSContext* cx) { return cx->compactingGC; }
 uint32_t CurrentGlobal(JSContext* cx) { return cx->global; }
 #else
 bool InspectObject(uint32_t pointer, ObjectInfo& info) {
@@ -403,8 +485,15 @@ MathOp IdentifyMath(uint32_t pointer) {
 int32_t OffSlots() { return int32_t(NativeObject::offsetOfSlots()); }
 uint64_t MajorGC(JSContext* cx) { return cx->runtime()->gc.majorGCCount(); }
 bool IncrementalGC(JSContext* cx) { return cx->runtime()->gc.isIncrementalGCInProgress(); }
+// Set once at the start of a collection (GCRuntime::startCollection); it can
+// only be cleared afterwards (reset before the Compact state), so a GC that
+// did not start compacting never moves cells.
+bool CompactingGC(JSContext* cx) { return cx->runtime()->gc.isCompactingGc(); }
 uint32_t CurrentGlobal(JSContext* cx) { return uint32_t(uintptr_t(cx->global().get())); }
 #endif
+
+// Typed array element kinds of an ArrTy variable (0: a dense ArrayObject).
+constexpr int kTypedInt32 = 1, kTypedFloat64 = 2;
 
 // Object layout used by the array ops: obj->shape->base->clasp identifies an
 // ArrayObject (class pointers are static; shapes may move), and the
@@ -422,6 +511,16 @@ uint32_t FrozenFlag() { return 0x40; }
 // -1: not an Array; 0: other element types; 1: Int32; 2: numbers.
 int ArrayKind(uint64_t bits) { return MockArrayKind(uint32_t(bits)); }
 bool AtomIsLength(JSScript*, jsbytecode* pc) { return MockAtomIsLength(pc); }
+// Mock fixed-length typed arrays (see emit.cpp): length and data pointer
+// payloads in the low words of fixed slots at 16 and 24.
+constexpr uint32_t kMockInt32ArrayClasp = 0x5100, kMockFloat64ArrayClasp = 0x5200;
+int TypedKind(uint64_t bits) { return ::MockTypedKind(uint32_t(bits)); }
+int RowKind(uint64_t bits) { return ::MockRowKind(uint32_t(bits)); }
+uint32_t TypedClasp(int kind) {
+  return kind == kTypedInt32 ? kMockInt32ArrayClasp : kMockFloat64ArrayClasp;
+}
+int32_t OffTypedLength() { return 16; }
+int32_t OffTypedData() { return 24; }
 #else
 uint32_t ArrayClasp() { return uint32_t(uintptr_t(&ArrayObject::class_)); }
 int32_t OffShape() { return int32_t(offsetof(JS::shadow::Object, shape)); }  // offsetOfShape is protected
@@ -452,6 +551,39 @@ int ArrayKind(uint64_t bits) {
 bool AtomIsLength(JSScript* script, jsbytecode* pc) {
   return StringEqualsLiteral(script->getAtom(pc), "length");
 }
+// Fixed-length (not resizable or immutable) Int32Array and Float64Array only.
+// Their LENGTH_SLOT and DATA_SLOT hold PrivateValues (the size_t/pointer is
+// the low word on wasm32). Detaching the buffer stores length 0, so the
+// per-access bounds check against the current length slot also covers a
+// detached buffer; the compiled loop itself never runs JS or GC.
+int TypedKind(uint64_t bits) {
+  Value v = Value::fromRawBits(bits);
+  if (!v.isObject()) return 0;
+  const JSClass* c = v.toObject().getClass();
+  if (c == &TypedArrayObject::fixedLengthClasses[Scalar::Int32]) return kTypedInt32;
+  if (c == &TypedArrayObject::fixedLengthClasses[Scalar::Float64]) return kTypedFloat64;
+  return 0;
+}
+uint32_t TypedClasp(int kind) {
+  return uint32_t(uintptr_t(&TypedArrayObject::fixedLengthClasses[
+      kind == kTypedInt32 ? Scalar::Int32 : Scalar::Float64]));
+}
+// For an Array whose element 0 is an Array: that row's ArrayKind (1 or 2),
+// else 0. Only a compile-time hint; every row and element read is checked.
+int RowKind(uint64_t bits) {
+  Value v = Value::fromRawBits(bits);
+  if (!v.isObject() || !v.toObject().is<ArrayObject>()) return 0;
+  ArrayObject& a = v.toObject().as<ArrayObject>();
+  if (a.getDenseInitializedLength() == 0) return 0;
+  Value e = a.getDenseElement(0);
+  if (!e.isObject()) return 0;
+  int k = ArrayKind(e.asRawBits());
+  return k > 0 ? k : 0;
+}
+int32_t OffTypedLength() { return ArrayBufferViewObject::lengthOffset(); }
+int32_t OffTypedData() { return ArrayBufferViewObject::dataOffset(); }
+static_assert(sizeof(size_t) == 4 && sizeof(void*) == 4,
+              "typed array PrivateValue low-word loads assume wasm32");
 #endif
 
 // Wasm local layout: params 0..22 (i64); i32 locals frame, sp, interrupt
@@ -503,6 +635,8 @@ struct Compiler {
   uint32_t nguards = 0;
   size_t guardInsertion = 0;
   Ty elemTy[kMaxVars];  // for Array vars: Int, Double or Unknown
+  int typedKind[kMaxVars] = {};  // for Array vars: 0, kTypedInt32 or kTypedFloat64
+  Ty rowTy[kMaxVars] = {};  // for Array vars of other elements: kRowInt/kRowNum or Unknown
   uint32_t maxArg = 0;  // 1 + highest argument index used
   // Forward jump targets inside the region, ascending. Each one is the end
   // of a wasm block opened at the top of the loop body (innermost first).
@@ -816,6 +950,14 @@ struct Compiler {
       if (uint32_t(bits >> 32) == kTagObject) {
         // An Array the loop never replaces: its local holds the pointer.
         int kind = ArrayKind(bits);
+        typedKind[v] = kind < 0 ? TypedKind(bits) : 0;
+        if (typedKind[v]) {
+          // A fixed-length Int32Array/Float64Array the loop never replaces.
+          if (varWritten[v]) return reject("array var written", head);
+          headTy[v] = ArrTy(v);
+          elemTy[v] = typedKind[v] == kTypedInt32 ? Ty::Int : Ty::Double;
+          continue;
+        }
         if (kind < 0) {
           if (!InspectObject(uint32_t(bits), objects[v]) || !objects[v].plain)
             return reject("head type", head);
@@ -826,6 +968,11 @@ struct Compiler {
         if (varWritten[v]) return reject("array var written", head);
         headTy[v] = ArrTy(v);
         elemTy[v] = kind == 0 ? Ty::Unknown : kind == 2 ? Ty::Double : Ty::Int;
+        rowTy[v] = Ty::Unknown;
+        if (kind == 0) {
+          int rk = RowKind(bits);
+          if (rk) rowTy[v] = rk == 2 ? kRowNum : kRowInt;
+        }
         if (elemTy[v] == Ty::Int && (widen.elems >> v & 1)) elemTy[v] = Ty::Double;
         continue;
       }
@@ -893,11 +1040,42 @@ struct Compiler {
     }
   }
 
+  // An Int32 Mul product of 0 stands for -0 only where -0 and +0 give the
+  // same result: the next op adds it to / subtracts it from an Int32
+  // (x + -0 == x - -0 == x + 0 for every Int32 x) or is `| 0` (ToInt32).
+  // The next ops must not be join targets, so only this path reaches them.
+  bool negZeroUnobservable(jsbytecode* pc) {
+    jsbytecode* n = pc + GetBytecodeLength(pc);
+    if (n >= end || findTarget(n) >= 0) return false;
+    JSOp op = JSOp(*n);
+    if (op == JSOp::Add || op == JSOp::Sub)
+      return st.depth >= 3 && st.stack[st.depth - 3] == Ty::Int;
+    return truncatedNext(pc);
+  }
+  // The next two ops are `Zero; BitOr` (`| 0`), neither a join target. Int32
+  // operands only meet there, and neither op can exit, so the value between
+  // the current op and the BitOr is never seen by the interpreter.
+  bool truncatedNext(jsbytecode* pc) {
+    jsbytecode* n = pc + GetBytecodeLength(pc);
+    if (n >= end || findTarget(n) >= 0 || JSOp(*n) != JSOp::Zero) return false;
+    jsbytecode* n2 = n + GetBytecodeLength(n);
+    return n2 < end && findTarget(n2) < 0 && JSOp(*n2) == JSOp::BitOr;
+  }
+
   bool binaryInt(jsbytecode* pc, JSOp op) {
     if (st.depth < 2) return reject("underflow", pc);
     if (st.stack[st.depth - 1] != Ty::Int || st.stack[st.depth - 2] != Ty::Int)
       return reject("operand type", pc);
     uint32_t lhs = slotLocal(st.depth - 2), rhs = slotLocal(st.depth - 1);
+    if ((op == JSOp::Add || op == JSOp::Sub) && truncatedNext(pc)) {
+      // (a + b) | 0 and (a - b) | 0 of Int32s: the exact sum is a double
+      // integer below 2^33, so its ToInt32 is the wrapped i32 result. (Not
+      // Mul: a double product above 2^53 is rounded before ToInt32.)
+      lget(lhs), lget(rhs), code.put(op == JSOp::Add ? W_I32ADD : W_I32SUB);
+      lset(lhs);
+      st.depth--;
+      return true;
+    }
     switch (op) {
       case JSOp::Add:
       case JSOp::Sub:
@@ -909,7 +1087,7 @@ struct Compiler {
         code.put(W_LTEE), code.uleb(tmp64());
         lget(tmp64()), code.put(W_I32WRAP), code.put(W_I64EXTS);
         code.put(W_I64NE);
-        if (op == JSOp::Mul) {
+        if (op == JSOp::Mul && !negZeroUnobservable(pc)) {
           // -0: product == 0 and exactly one operand negative.
           lget(tmp64()), code.put(W_I32WRAP), code.put(W_I32EQZ);
           lget(lhs), lget(rhs), code.put(W_I32XOR);
@@ -1090,6 +1268,15 @@ struct Compiler {
     lget(slotLocal(ix)), lget(tmp32()), load32(OffInitLen()), code.put(W_I32GEU);
     bailIf(pc);
   }
+  // Typed array element: bail unless the Int32 in slot `ix` is below the
+  // current length of the typed array in slot `s`; tmp32 = element address.
+  void typedAddr(jsbytecode* pc, int kind, uint32_t s, uint32_t ix) {
+    lget(slotLocal(ix)), lget(slotLocal(s)), load32(OffTypedLength()), code.put(W_I32GEU);
+    bailIf(pc);
+    lget(slotLocal(s)), load32(OffTypedData());
+    lget(slotLocal(ix)), i32c(kind == kTypedInt32 ? 2 : 3), code.put(W_I32SHL), code.put(W_I32ADD);
+    lset(tmp32());
+  }
   // [] -> [], tmp32 = address of element `ix` of elements tmp32.
   void elemAddr(uint32_t ix) {
     lget(tmp32()), lget(slotLocal(ix)), i32c(3), code.put(W_I32SHL), code.put(W_I32ADD);
@@ -1100,10 +1287,23 @@ struct Compiler {
   bool getElem(jsbytecode* pc) {
     if (st.depth < 2) return reject("underflow", pc);
     Ty a = st.stack[st.depth - 2], i = st.stack[st.depth - 1];
-    if (!IsArr(a) || i != Ty::Int) return reject("operand type", pc);
-    Ty et = elemTy[ArrVar(a)];
+    if (!(IsArr(a) || IsRow(a)) || i != Ty::Int) return reject("operand type", pc);
+    Ty et = IsRow(a) ? (a == kRowInt ? Ty::Int : Ty::Double) : elemTy[ArrVar(a)];
+    if (IsArr(a) && !IsNum(et) && IsRow(rowTy[ArrVar(a)])) return getRow(pc, rowTy[ArrVar(a)]);
     if (!IsNum(et)) return reject("element type", pc);
     uint32_t s = st.depth - 2, out = slotLocal(s);
+    if (int k = IsArr(a) ? typedKind[ArrVar(a)] : 0) {
+      typedAddr(pc, k, s, s + 1);  // bails when out of bounds (undefined)
+      if (k == kTypedInt32) {
+        lget(tmp32()), code.put(W_I32LOAD), code.uleb(2), code.uleb(0), lset(out);
+      } else {
+        // Any NaN bits stay in the f64 local; boxStore canonicalizes them.
+        lget(tmp32()), code.put(W_F64LOAD), code.uleb(3), code.uleb(0), lset(fl(out));
+      }
+      st.depth--;
+      st.stack[s] = et;
+      return true;
+    }
     denseIndex(pc, s, s + 1);
     elemAddr(s + 1);
     lget(tmp32()), code.put(W_I64LOAD), code.uleb(3), code.uleb(0);
@@ -1129,17 +1329,57 @@ struct Compiler {
     return true;
   }
 
+  // Row read: [arr, index] -> [row]. Bails unless the element is an object
+  // whose class is ArrayObject. The row pointer is only kept in a wasm local
+  // and boxed back on exit; the loop runs no JS and no GC.
+  bool getRow(jsbytecode* pc, Ty row) {
+    uint32_t s = st.depth - 2, out = slotLocal(s);
+    denseIndex(pc, s, s + 1);
+    elemAddr(s + 1);
+    lget(tmp32()), code.put(W_I64LOAD), code.uleb(3), code.uleb(0);
+    code.put(W_LTEE), code.uleb(tmp64());
+    i64c(32), code.put(W_I64SHRU), code.put(W_I32WRAP);
+    i32c(int32_t(kTagObject)), code.put(W_I32NE);
+    bailIf(pc);  // hole, or not an object
+    lget(tmp64()), code.put(W_I32WRAP), code.put(W_LTEE), code.uleb(tmp32());
+    load32(OffShape()), load32(OffBase()), load32(OffClasp());
+    i32c(int32_t(ArrayClasp())), code.put(W_I32NE);
+    bailIf(pc);  // not an Array (the stack still holds [arr, index])
+    lget(tmp32()), lset(out);
+    st.depth--;
+    st.stack[s] = row;
+    return true;
+  }
+
   // Dense element write of a number over a number: [arr, index, v] -> [v].
   // Neither value is a GC thing, so no barriers are needed.
   bool setElem(jsbytecode* pc) {
     if (st.depth < 3) return reject("underflow", pc);
     uint32_t s = st.depth - 3;
     Ty a = st.stack[s], i = st.stack[s + 1], t = st.stack[s + 2];
-    if (!IsArr(a) || i != Ty::Int || !IsNum(t)) return reject("operand type", pc);
-    uint32_t v = ArrVar(a);
-    if (!IsNum(elemTy[v])) return reject("element type", pc);
-    if (elemTy[v] == Ty::Int && t == Ty::Double) {
-      want.elems |= 1u << v;
+    bool row = IsRow(a);
+    if (!(IsArr(a) || row) || i != Ty::Int || !IsNum(t)) return reject("operand type", pc);
+    uint32_t v = row ? 0 : ArrVar(a);
+    Ty et = row ? (a == kRowInt ? Ty::Int : Ty::Double) : elemTy[v];
+    if (int k = row ? 0 : typedKind[v]) {
+      // ToInt32 of a double store result is not modelled; only Int32 values
+      // go to an Int32Array. Any number goes to a Float64Array.
+      if (k == kTypedInt32 && t != Ty::Int) return reject("typed element type", pc);
+      typedAddr(pc, k, s, s + 1);  // out of bounds: bail (PBL ignores the store)
+      lget(tmp32());
+      if (k == kTypedInt32) {
+        lget(slotLocal(s + 2)), code.put(W_I32STORE), code.uleb(2), code.uleb(0);
+      } else {
+        getNum(slotLocal(s + 2), t), code.put(W_F64STORE), code.uleb(3), code.uleb(0);
+      }
+      move(slotLocal(s + 2), slotLocal(s), t);
+      st.depth -= 2;
+      st.stack[s] = t;
+      return true;
+    }
+    if (!IsNum(et)) return reject("element type", pc);
+    if (et == Ty::Int && t == Ty::Double) {
+      if (!row) want.elems |= 1u << v;
       return reject("element widen", pc);
     }
     denseIndex(pc, s, s + 1);
@@ -1157,10 +1397,13 @@ struct Compiler {
   }
 
   // Array `.length`: [arr] -> [Int32]; lengths above INT32_MAX bail.
+  // Typed arrays are rejected: their `length` is an inherited accessor that
+  // JS can redefine, so the internal length slot need not be the JS result.
   bool getLength(jsbytecode* pc) {
     if (st.depth < 1) return reject("underflow", pc);
     uint32_t s = st.depth - 1;
-    if (!IsArr(st.stack[s])) return reject("operand type", pc);
+    if (!IsArr(st.stack[s]) && !IsRow(st.stack[s])) return reject("operand type", pc);
+    if (IsArr(st.stack[s]) && typedKind[ArrVar(st.stack[s])]) return reject("typed length", pc);
     lget(slotLocal(s)), load32(OffElements()), load32(OffLength());
     code.put(W_LTEE), code.uleb(tmp32());
     i32c(0), code.put(W_I32LTS);
@@ -1407,7 +1650,7 @@ struct Compiler {
         load32(OffShape());
         if (IsArr(headTy[v])) {
           load32(OffBase()), load32(OffClasp());
-          i32c(int32_t(ArrayClasp()));
+          i32c(int32_t(typedKind[v] ? TypedClasp(typedKind[v]) : ArrayClasp()));
         } else {
           i32c(int32_t(objects[v].shape));
         }
@@ -1701,7 +1944,7 @@ struct Compiler {
           icIndex++;
           break;
         case JSOp::GetProp:
-          if (st.depth && IsArr(st.stack[top])) {
+          if (st.depth && (IsArr(st.stack[top]) || IsRow(st.stack[top]))) {
             if (!AtomIsLength(script, pc)) return reject("GetProp", pc);
             if (!getLength(pc)) return false;
           } else if (!getProperty(pc)) return false;
@@ -1821,15 +2064,27 @@ void LogReject(JSScript* script, const Compiler& c) {
           c.reason ? c.reason : "?");
 }
 
-void Evict(Entry* e) {
-  if (e->fn) {
-    syscall(SYS_jit_free, long(e->fn), 1L);
-  }
+void FreeNative(uint32_t fn, uint32_t slot, JSContext* cx,
+                const char* cause, bool gcEviction = false) {
+  long rc = syscall(SYS_jit_free, long(fn), 1L);
+  const int syscallErrno = errno;
+  cacheobs::Released(slot, fn, MajorGC(cx), cause, rc,
+                     rc == -1 ? syscallErrno : 0, gcEviction,
+                     [&](const cacheobs::Record& old) {
+    ObserveLocation(old.file, old.line, old.off, cx, "gc-evict", old.fn);
+  });
+  errno = syscallErrno;
+}
+
+void Evict(Entry* e, uint32_t slot, JSContext* cx, const char* cause,
+           bool gcEviction = false) {
+  if (e->fn) FreeNative(e->fn, slot, cx, cause, gcEviction);
   free(e->bytes);
   memset(e, 0, sizeof *e);
 }
 
-bool Install(JSScript* script, jsbytecode* pc, Entry* e, Compiler& c, Buf& m) {
+bool Install(JSScript* script, jsbytecode* pc, Entry* e, Compiler& c, Buf& m,
+             JSContext* cx, uint32_t slot) {
   if (c.reason) {
     LogReject(script, c);
     return false;
@@ -1843,10 +2098,15 @@ bool Install(JSScript* script, jsbytecode* pc, Entry* e, Compiler& c, Buf& m) {
     if (TakeLog()) fprintf(stderr, "PBLJIT install rc=%ld bytes=%zu\n", rc, m.n);
     return false;
   }
+  if (cacheobs::CaptureEnabled()) {
+    cacheobs::Installed(script->filename(), script->lineno(),
+                        unsigned(pc - script->code()), slot, idx[0], e->majorGC,
+                        uintptr_t(script), uintptr_t(pc));
+  }
   size_t len = size_t(c.end - pc);
   e->bytes = static_cast<uint8_t*>(malloc(len));
   if (!e->bytes) {
-    syscall(SYS_jit_free, long(idx[0]), 1L);
+    FreeNative(idx[0], slot, cx, "install-allocation-failure");
     return false;
   }
   memcpy(e->bytes, pc, len);
@@ -1863,7 +2123,7 @@ bool Install(JSScript* script, jsbytecode* pc, Entry* e, Compiler& c, Buf& m) {
             unsigned(pc - script->code()), len, c.nops, c.nvars, c.maxDepth,
             m.n, idx[0], c.attempts, static_cast<unsigned long long>(e->majorGC));
   }
-  if ((n & (n - 1)) == 0) {
+  if ((n & (n - 1)) == 0 && gLogEnabled.load(std::memory_order_relaxed)) {
     fprintf(stderr,
             "PBLJIT stats compiles=%u rejects=%u runs=%u bails=%u\n", n,
             gRejects.load(std::memory_order_relaxed),
@@ -1874,7 +2134,7 @@ bool Install(JSScript* script, jsbytecode* pc, Entry* e, Compiler& c, Buf& m) {
 }
 
 bool Compile(JSScript* script, jit::BaselineFrame* frame, jsbytecode* pc,
-             Entry* e, JSContext* cx) {
+             Entry* e, JSContext* cx, uint32_t slot) {
   if (gInstalls.load(std::memory_order_relaxed) >= kMaxInstalls) return false;
   Buf m;
   Compiler* cp = TranslateLoop(
@@ -1892,7 +2152,7 @@ bool Compile(JSScript* script, jit::BaselineFrame* frame, jsbytecode* pc,
       },
       m);
   if (!cp) return false;
-  bool ok = Install(script, pc, e, *cp, m);
+  bool ok = Install(script, pc, e, *cp, m, cx, slot);
   FreeCompiler(cp);
   return ok;
 }
@@ -1903,21 +2163,28 @@ typedef int64_t (*JitFn)(void* frame, void* sp, void* intr, void* out,
                          void* argv);
 
 // Diagnostic-only bounded observer. Owned source filter preserves budget.
-bool ObserverEnabled(JSScript* script) {
+bool ObserverActive() {
   static const bool enabled = [] {
     const char* v = getenv("PBLJIT_OBSERVE");
     return v && strcmp(v, "1") == 0;
   }();
-  if (!enabled) return false;
+  return enabled;
+}
+
+bool ObserverFilenameEnabled(const char* filename) {
+  if (!ObserverActive()) return false;
   static constexpr char prefix[] = "file:///home/admin/nightly-jit-safety/";
-  const char* filename = script->filename();
   return filename && strncmp(filename, prefix, sizeof(prefix) - 1) == 0;
 }
 
-void Observe(JSScript* script, jsbytecode* pc, JSContext* cx,
-             const char* event, uint32_t fn = 0, int64_t kind = -1,
-             uint32_t sp = 0, int32_t delta = 0, uint32_t ic = 0) {
-  if (!ObserverEnabled(script)) return;
+bool ObserverEnabled(JSScript* script) {
+  return ObserverActive() && ObserverFilenameEnabled(script->filename());
+}
+
+void ObserveLocation(const char* filename, unsigned line, unsigned off, JSContext* cx,
+                     const char* event, uint32_t fn, int64_t kind,
+                     uint32_t sp, int32_t delta, uint32_t ic) {
+  if (!ObserverFilenameEnabled(filename)) return;
   static std::atomic<int> remaining{4096};
   int observationRemaining = remaining.fetch_sub(1, std::memory_order_relaxed);
   if (observationRemaining <= 0) {
@@ -1926,11 +2193,18 @@ void Observe(JSScript* script, jsbytecode* pc, JSContext* cx,
     return;
   }
   PrintObservation("PBLJIT_OBS_EXHAUSTED reason=emission-failed\n", "PBLJIT_OBS event=%s file=%s line=%u off=%u tid=%ld pthread=%lu tls=%p epoch=%llu fn=%u kind=%lld sp=%u pcDelta=%d ic=%u\n",
-          event, script->filename() ? script->filename() : "?",
-          script->lineno(), unsigned(pc - script->code()),
+          event, filename, line, off,
           syscall(SYS_gettid), static_cast<unsigned long>((uintptr_t)pthread_self()), static_cast<void*>(&tCache),
           static_cast<unsigned long long>(MajorGC(cx)), fn,
           static_cast<long long>(kind), sp, delta, ic);
+}
+
+void Observe(JSScript* script, jsbytecode* pc, JSContext* cx,
+             const char* event, uint32_t fn = 0, int64_t kind = -1,
+             uint32_t sp = 0, int32_t delta = 0, uint32_t ic = 0) {
+  if (!ObserverEnabled(script)) return;
+  ObserveLocation(script->filename(), script->lineno(), unsigned(pc - script->code()),
+                  cx, event, fn, kind, sp, delta, ic);
 }
 
 void ObserveSkip(JSScript* script, jsbytecode* pc, JSContext* cx,
@@ -1976,12 +2250,33 @@ void ObservePolicy(JSScript* script, JSContext* cx) {
 
 bool OnLoopHead(JSScript* script, jit::BaselineFrame* frame, uint64_t* sp,
                 jsbytecode* pc, JSContext* cx, Exit* exit) {
-  // The generated module contains untraced shape/object constants. Never
-  // dereference them while incremental GC is active or after any major GC.
-  if (IncrementalGC(cx)) {
+  // The generated module embeds untraced shape/object/script pointers. They
+  // are safe to use exactly while every embedded cell is alive and unmoved:
+  //  - Entries are stamped with the major GC number, which is bumped in the
+  //    first slice of every major GC, before any cell is marked, swept or
+  //    moved; entries from an older epoch are evicted, never run.
+  //  - The compiler takes pointers only through strong edges from what the
+  //    running program can reach now (frame values, obj->shape(), slots,
+  //    the current global and its lexical environment, property maps; no
+  //    weak tables or IC stub fields). Under snapshot-at-the-beginning
+  //    marking with allocate-black, every such cell is marked by this GC
+  //    (reachable at its start, or allocated during it), so sweeping never
+  //    finalizes it; it stays alive until the next epoch bump. Unmarked
+  //    cells are unreachable through strong edges, also during sweeping.
+  //  - Only a compacting GC moves tenured cells (embedded object constants
+  //    must be tenured; shapes always are). isCompactingGc() is fixed at
+  //    the start of the GC and can only be cleared before compaction.
+  //  - Loop code never stores GC things, allocates or calls, and leaves at
+  //    backedges on interrupt, so it needs no pre/post/read barriers.
+  // Hence: refuse during a compacting incremental GC only (any incremental
+  // GC with PBLJIT_INCRGC=0).
+  if (IncrementalGC(cx) && (!IncrGCAllowed() || CompactingGC(cx))) {
     ObserveSkip(script, pc, cx, "skip-incremental");
+    if (MOZ_UNLIKELY(gPblTierStat)) gPblTsIncrSkip++;
+    gPblLoopMiss = 1;
     return false;
   }
+  gPblLoopMiss = 0;
   uint64_t gc = MajorGC(cx);
   Entry* cache = tCache;
   if (MOZ_UNLIKELY(!cache)) {
@@ -1993,30 +2288,47 @@ bool OnLoopHead(JSScript* script, jit::BaselineFrame* frame, uint64_t* sp,
   uint32_t h = CacheIndex(script, pc);
   Entry* e = &cache[h];
   if (MOZ_UNLIKELY(e->pc != pc || e->script != script || e->majorGC != gc)) {
+    // Own entry from an older GC epoch: 2; another loop's slot: 1.
+    gPblLoopMiss = (e->pc == pc && e->script == script) ? 2 : 1;
+    if (MOZ_UNLIKELY(gPblTierStat) && e->state == 1 && e->majorGC != gc)
+      gPblTsEvictGc++;
     if (e->state == 1 && e->majorGC != gc && TakeLog()) {
       fprintf(stderr, "PBLJIT GC evict oldEpoch=%llu newEpoch=%llu\n",
               static_cast<unsigned long long>(e->majorGC),
               static_cast<unsigned long long>(gc));
     }
-    if (e->state == 1 && e->majorGC != gc) Observe(script, pc, cx, "gc-evict", e->fn);
-    Evict(e);
+    bool gcOwn = e->state == 1 && e->majorGC != gc && e->pc == pc &&
+                 e->script == script;
+    Evict(e, h, cx,
+          cacheobs::ReplacementCause(e->pc == pc && e->script == script, e->majorGC == gc),
+          e->state == 1 && e->majorGC != gc);
     e->pc = pc;
     e->script = script;
     e->majorGC = gc;
     e->global = CurrentGlobal(cx);
+    // Its own code was just dropped by an epoch change: recompile now.
+    if (gcOwn && FastRecomp()) e->hits = kCompileHits - 1;
   }
-  if (e->global != CurrentGlobal(cx)) return false;
+  if (e->global != CurrentGlobal(cx)) {
+    gPblLoopMiss = 1;
+    return false;
+  }
   if (e->state != 1) {
-    if (e->state == 2 || ++e->hits < kCompileHits) return false;
-    e->state = Compile(script, frame, pc, e, cx) ? 1 : 2;
+    if (e->state == 2) return false;  // persistent (gPblLoopMiss 0)
+    if (++e->hits < kCompileHits) {
+      if (gPblLoopMiss == 0) gPblLoopMiss = 1;  // counting phase
+      return false;
+    }
+    e->state = Compile(script, frame, pc, e, cx, h) ? 1 : 2;
     if (e->state != 1) { ObserveSkip(script, pc, cx, "reject"); return false; }
     Observe(script, pc, cx, "install", e->fn);
   }
   // Same pc pointer, possibly a different (re-allocated) script: compare.
   if (MOZ_UNLIKELY(pc + e->len > script->codeEnd() ||
                    memcmp(pc, e->bytes, e->len) != 0)) {
-    Evict(e);
+    Evict(e, h, cx, "bytes");
     e->pc = pc;
+    gPblLoopMiss = 1;
     return false;
   }
   // The code was specialized for a frame whose argv has >= nargs unaliased
@@ -2046,9 +2358,10 @@ bool OnLoopHead(JSScript* script, jit::BaselineFrame* frame, uint64_t* sp,
   if (kind == NoEntry || kind == Bail) {
     gBails.fetch_add(1, std::memory_order_relaxed);
     if (++e->bails >= kMaxBails) {
-      syscall(SYS_jit_free, long(e->fn), 1L);
+      FreeNative(e->fn, h, cx, "bail-limit");
       e->fn = 0;
       e->state = 2;
+      if (MOZ_UNLIKELY(gPblTierStat)) gPblTsDisable++;
       if (TakeLog()) {
         fprintf(stderr, "PBLJIT disable %s:%u off=%u after %u bails\n",
                 script->filename() ? script->filename() : "?",
